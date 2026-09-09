@@ -1,0 +1,11 @@
+﻿mode,feature,loss_increase_mean,loss_increase_sd,n_repeats,split
+paper_history,age,-0.00244750976563,0.013041114296,10,test
+paper_history,height,0.00968260765076,0.00339504846093,10,test
+paper_history,weight,0.0017284154892,0.00468547873033,10,test
+paper_history,bmi,0.00480133891106,0.00430361110404,10,test
+paper_history,longitudinal,15.4319486141,2.23115170142,10,test
+static_interval,age,-0.00760279297829,0.0323208788535,10,test
+static_interval,height,0.0156872212887,0.0144490148837,10,test
+static_interval,weight,0.0384631812572,0.0227237425039,10,test
+static_interval,bmi,0.0277347683907,0.013212400676,10,test
+static_interval,longitudinal,0,0,10,test

@@ -1,0 +1,7 @@
+﻿mode,split,n,events,loss,c_index,interpretation
+paper_history,train,159,155,0.636678934097,0.899305205921,完整轨迹重构GPR伪标签，非前瞻精度
+paper_history,validation,54,52,0.655480504036,0.893485005171,完整轨迹重构GPR伪标签，非前瞻精度
+paper_history,test,54,53,0.690700292587,0.893428063943,完整轨迹重构GPR伪标签，非前瞻精度
+static_interval,train,159,155,0.58060336113,0.679045092838,基线静态特征；实测区间删失
+static_interval,validation,54,52,0.410586565733,0.738916256158,基线静态特征；实测区间删失
+static_interval,test,54,53,0.605855822563,0.68458781362,基线静态特征；实测区间删失

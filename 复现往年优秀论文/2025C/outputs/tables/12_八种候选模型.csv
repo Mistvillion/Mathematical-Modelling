@@ -1,0 +1,9 @@
+﻿formula,aic_ml,bic_ml,ll_ml,converged
+week + bmi,-5059.26187718,-5034.32904489,2534.63093859,True
+week + bmi + week_bmi,-5059.09095434,-5029.17155558,2535.54547717,True
+week + bmi + bmi_sq,-5057.44094131,-5027.52154256,2534.72047066,True
+week + bmi + bmi_sq + week_bmi,-5058.0399756,-5023.13401038,2536.0199878,True
+week + bmi + week_sq,-5078.93070448,-5049.01130572,2545.46535224,True
+week + bmi + week_sq + week_bmi,-5077.35819839,-5042.45223317,2545.67909919,True
+week + bmi + week_sq + bmi_sq,-5077.20153387,-5042.29556865,2545.60076693,True
+week + bmi + week_sq + bmi_sq + week_bmi,-5076.01934736,-5036.12681568,2546.00967368,True

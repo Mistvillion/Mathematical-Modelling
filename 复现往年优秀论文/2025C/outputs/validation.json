@@ -1,0 +1,70 @@
+{
+  "passed": true,
+  "checks": [
+    {
+      "check": "孕周转换及坏输入",
+      "passed": true,
+      "detail": "通过"
+    },
+    {
+      "check": "原始附件与清洗、标签一致",
+      "passed": true,
+      "detail": "男胎1082条/267人；女胎605条/147人"
+    },
+    {
+      "check": "GPR三阶段规则和删失保留",
+      "passed": true,
+      "detail": "有限260人；未达标7人"
+    },
+    {
+      "check": "第一问独立论文参考值核对",
+      "passed": true,
+      "detail": "表1系数误差<1e-5；ICC、LR与GLS Wald对齐原文精度"
+    },
+    {
+      "check": "动态规划对独立穷举例及重复BMI边界",
+      "passed": true,
+      "detail": "8人例：DP风险=62.0，与所有分割点穷举相等"
+    },
+    {
+      "check": "日插值、尾部未达标处理",
+      "passed": true,
+      "detail": "通过"
+    },
+    {
+      "check": "LSTM填充不变性与静态模式隔离",
+      "passed": true,
+      "detail": "通过"
+    },
+    {
+      "check": "删失似然的手算概率例",
+      "passed": true,
+      "detail": "通过"
+    },
+    {
+      "check": "生存概率守恒、单调性及孕妇划分",
+      "passed": true,
+      "detail": "{'train': 159, 'test': 54, 'validation': 54}"
+    },
+    {
+      "check": "BMI分组覆盖、规模约束和风险审计",
+      "passed": true,
+      "detail": "通过"
+    },
+    {
+      "check": "女胎无身份泄漏、按孕妇OOF和概率一致性",
+      "passed": true,
+      "detail": "605条OOF预测覆盖147位孕妇"
+    },
+    {
+      "check": "数据、计算源代码、CSV指纹和图文件齐全",
+      "passed": true,
+      "detail": "48张表，35份单图脚本"
+    },
+    {
+      "check": "README及学习文档链接",
+      "passed": true,
+      "detail": "检查160个本地文档链接"
+    }
+  ]
+}

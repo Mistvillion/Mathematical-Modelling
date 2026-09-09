@@ -1,0 +1,12 @@
+# Python >= 3.12；本次精确版本记录在 outputs/run_metadata.json。
+numpy>=2.0,<3
+pandas>=2.2,<4
+scipy>=1.14,<2
+statsmodels>=0.14,<0.16
+scikit-learn>=1.5,<2
+matplotlib>=3.9,<4
+openpyxl>=3.1,<4
+torch>=2.4,<3
+lightgbm>=4.5,<5
+optuna>=4,<6
+tabulate>=0.9,<1

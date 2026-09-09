@@ -1,0 +1,11 @@
+﻿mode,target,k,ga_risk,dp_risk,gap,minimum_group_size,n_subjects
+paper_history,50,3,1135,1127,8,50,267
+paper_history,75,3,1335,1335,0,50,267
+paper_history,90,3,1850,1835,15,50,267
+paper_history,95,3,2670,2670,0,50,267
+paper_history,99,3,208000590,207000600,999990,50,267
+static_interval,50,3,267,267,0,50,267
+static_interval,75,3,1335,1335,0,50,267
+static_interval,90,3,1335,1335,0,50,267
+static_interval,95,3,1335,1335,0,50,267
+static_interval,99,3,1335,1335,0,50,267

@@ -1,0 +1,8 @@
+﻿person_id,mean_bmi,n_records,correlation,gpr_preliminary,observed_first,t_attain,finite,selected_by,last_week
+A007,34.099890848,5,0.49644202143,inf,inf,inf,False,未达标,23.7142857143
+A010,35.3015873029,7,0.593110481277,inf,inf,inf,False,未达标,24.7142857143
+A074,46.875,2,1,inf,inf,inf,False,未达标,15.7142857143
+A077,34.49388648,2,-1,inf,inf,inf,False,未达标,16.5714285714
+A083,32.4188319533,3,0.409381723818,inf,inf,inf,False,未达标,23
+A113,32.919589435,4,-0.525483914462,inf,inf,inf,False,未达标,24.2857142857
+A123,30.42719786,1,,inf,inf,inf,False,未达标,11.7142857143
