@@ -2,12 +2,14 @@
 
 模型依据 docs/Q1.md：将一天离散为 144 个 10 分钟时段，使用混合整数
 线性规划决定外网购电量、储能充放电量、弃光量和储电量。所有计算保留完整
-精度，通过约束校验后再将结果写入 outputs/tables。
+精度，通过约束校验后再将结果写入 outputs/tables，并按附件 5 模板生成
+outputs/results/result1.xlsx。
 """
 
 from __future__ import annotations
 
 import csv
+import shutil
 from dataclasses import dataclass
 from datetime import time
 from math import isfinite
@@ -20,8 +22,12 @@ from scipy.sparse import lil_matrix
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
-DATA_FILE = PROJECT_DIR / "CUMCM 2026 C题" / "附件" / "附件1.xlsx"
+ATTACHMENT_DIR = PROJECT_DIR / "CUMCM 2026 C题" / "附件"
+DATA_FILE = ATTACHMENT_DIR / "附件1.xlsx"
+RESULT_TEMPLATE_FILE = ATTACHMENT_DIR / "附件5" / "result1.xlsx"
 OUTPUT_DIR = PROJECT_DIR / "outputs" / "tables"
+RESULT_OUTPUT_DIR = PROJECT_DIR / "outputs" / "results"
+RESULT_FILE = RESULT_OUTPUT_DIR / "result1.xlsx"
 
 N_PERIODS = 144
 DELTA_T = 1 / 6
@@ -47,6 +53,7 @@ class DailyData:
     """附件 1 中完成时间对齐后的单日输入。"""
 
     interval_labels: list[str]
+    result_interval_labels: list[str]
     price: np.ndarray
     load_power: np.ndarray
     photovoltaic_power: np.ndarray
@@ -115,6 +122,18 @@ def format_clock(minutes: int) -> str:
     return f"{hour:02d}:{minute:02d}"
 
 
+def format_result_clock(minutes: int) -> str:
+    """按附件 5 的格式显示时刻，并保留跨日标记。"""
+    if not 0 <= minutes <= 24 * 60 + 10:
+        raise ValueError(f"结果模板时刻超出允许范围：{minutes}")
+    day_offset, minute_of_day = divmod(minutes, 24 * 60)
+    hour, minute = divmod(minute_of_day, 60)
+    label = f"{hour}:{minute:02d}"
+    if day_offset:
+        label += f"+{day_offset}"
+    return label
+
+
 def validate_number(value: object, row_number: int, column_name: str) -> float:
     """检查附件中的模型输入是否为有限非负数。"""
     if (
@@ -170,8 +189,13 @@ def load_daily_data() -> DailyData:
     interval_labels = [
         f"{format_clock(end - 10)}-{format_clock(end)}" for end in end_minutes
     ]
+    result_interval_labels = [
+        f"{format_result_clock(start)}-{format_result_clock(start + 10)}"
+        for start in end_minutes
+    ]
     return DailyData(
         interval_labels=interval_labels,
+        result_interval_labels=result_interval_labels,
         price=price,
         load_power=load_power,
         photovoltaic_power=photovoltaic_power,
@@ -575,6 +599,96 @@ def write_model_checks(result: DispatchResult, checks: ModelChecks) -> Path:
     return path
 
 
+def write_result_workbook(data: DailyData, result: DispatchResult) -> Path:
+    """复制附件 5 模板，并填入问题一要求的完整结果。"""
+    if not RESULT_TEMPLATE_FILE.exists():
+        raise FileNotFoundError(f"未找到问题一结果模板：{RESULT_TEMPLATE_FILE}")
+
+    RESULT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(RESULT_TEMPLATE_FILE, RESULT_FILE)
+
+    workbook = load_workbook(RESULT_FILE)
+    try:
+        required_sheets = {"计划购电量", "充放电量"}
+        missing_sheets = required_sheets.difference(workbook.sheetnames)
+        if missing_sheets:
+            raise ValueError(
+                "问题一结果模板缺少工作表：" + "、".join(sorted(missing_sheets))
+            )
+
+        purchase_sheet = workbook["计划购电量"]
+        expected_purchase_headers = ("时间段", "购电量")
+        actual_purchase_headers = tuple(
+            purchase_sheet.cell(row=1, column=column).value
+            for column in range(1, 3)
+        )
+        if actual_purchase_headers != expected_purchase_headers:
+            raise ValueError(
+                f"计划购电量工作表表头应为：{expected_purchase_headers}"
+            )
+
+        template_intervals = [
+            purchase_sheet.cell(row=row, column=1).value
+            for row in range(2, N_PERIODS + 2)
+        ]
+        if template_intervals != data.result_interval_labels:
+            raise ValueError("计划购电量工作表的时间段与附件 1 顺序不一致。")
+
+        for row, value in enumerate(result.grid_purchase, start=2):
+            cell = purchase_sheet.cell(row=row, column=2)
+            cell.value = float(value)
+            cell.number_format = "0.000000"
+
+        storage_sheet = workbook["充放电量"]
+        expected_storage_headers = ("时间段", "充电量", "放电量", "时刻", "储电量")
+        actual_storage_headers = tuple(
+            storage_sheet.cell(row=1, column=column).value
+            for column in range(1, 6)
+        )
+        if actual_storage_headers != expected_storage_headers:
+            raise ValueError(
+                f"充放电量工作表表头应为：{expected_storage_headers}"
+            )
+
+        expected_blocks = [
+            f"{block * 4}:00-{(block + 1) * 4}:00" for block in range(6)
+        ]
+        template_blocks = [
+            storage_sheet.cell(row=row, column=1).value for row in range(2, 8)
+        ]
+        if template_blocks != expected_blocks:
+            raise ValueError("充放电量工作表的汇总时间段与题目要求不一致。")
+        if (
+            storage_sheet["D2"].value != "0:00"
+            or storage_sheet["D3"].value != "24:00"
+        ):
+            raise ValueError("充放电量工作表的储电量时刻与题目要求不一致。")
+
+        periods_per_block = 4 * 6
+        for block in range(6):
+            start = block * periods_per_block
+            stop = (block + 1) * periods_per_block
+            row = block + 2
+            charge_cell = storage_sheet.cell(row=row, column=2)
+            discharge_cell = storage_sheet.cell(row=row, column=3)
+            charge_cell.value = float(np.sum(result.charge[start:stop]))
+            discharge_cell.value = float(np.sum(result.discharge[start:stop]))
+            charge_cell.number_format = "0.000000"
+            discharge_cell.number_format = "0.000000"
+
+        storage_sheet["E2"] = float(result.stored_energy[0])
+        storage_sheet["E3"] = float(result.stored_energy[-1])
+        storage_sheet["E2"].number_format = "0.000000"
+        storage_sheet["E3"].number_format = "0.000000"
+        storage_sheet.column_dimensions["E"].width = 14
+
+        workbook.save(RESULT_FILE)
+    finally:
+        workbook.close()
+
+    return RESULT_FILE
+
+
 def main() -> None:
     """读取数据、求解、校验并输出问题一结果。"""
     data = load_daily_data()
@@ -587,6 +701,7 @@ def main() -> None:
         write_purchase_summary(data, result),
         write_storage_summary(data, result),
         write_model_checks(result, checks),
+        write_result_workbook(data, result),
     ]
 
     print(f"求解状态：{result.solver_message}")
