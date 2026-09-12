@@ -11,8 +11,9 @@
 
 2. L1 全知日预测同策略
    只把逐日预测替换为当日实测值，其余策略结构（0:00 冻结全天计划购电量、日内滚动
-   执行储能、日末储电量软目标、年末储电量区间）与正式方案完全一致。该口径用于把
-   正式方案与理论下界的差距分解为“预测误差代价”和“逐日结构代价”两部分。
+   执行储能、包括 12 月 31 日在内的日末储电量软目标、全年结束后的实际年末区间
+   验收）与正式方案完全一致。该口径用于把正式方案与理论下界的差距分解为
+   “预测误差代价”和“逐日结构代价”两部分。
 
 3. L0 因果滚动结果
    直接读取 outputs/tables/2_每日运行审计.csv 与 2_滚动预测与调度明细.csv，作为
@@ -573,7 +574,6 @@ def run_perfect_daily_forecast(
         actual_photovoltaic = np.asarray(
             data.actual_photovoltaic_energy[day_index], dtype=float
         )
-        hard_terminal = day == rolling.YEAR_END
         forecast = rolling.Forecast(
             load_energy=actual_load.copy(),
             photovoltaic_energy=actual_photovoltaic.copy(),
@@ -581,10 +581,9 @@ def run_perfect_daily_forecast(
             used_prior_load=False,
             used_prior_photovoltaic=False,
         )
-        # 与主脚本一致：计划阶段在年末采用硬区间，日内执行阶段仍保留日末软目标。
+        # 与主脚本一致：12 月 31 日的计划与日内执行都沿用普通日期的日末软目标。
         plan = rolling.solve_validated_plan(
-            day, price, forecast, current_energy,
-            0.0 if hard_terminal else penalty, hard_terminal,
+            day, price, forecast, current_energy, penalty, False,
         )
         replay = rolling.replay_actual_day(
             price, plan, forecast, actual_load, actual_photovoltaic,
@@ -616,12 +615,17 @@ def run_perfect_daily_forecast(
             unused_purchase=unused_purchase,
             emergency_purchase=replay.emergency_purchase.copy(),
         )
-        if rolling.terminal_interval_error(result.end_energy) > rolling.TERMINAL_TOLERANCE:
-            raise RuntimeError(f"{day} 完美日预测的年末储电量越界。")
         results.append(result)
         current_energy = result.end_energy
     if len(results) != rolling.OFFICIAL_DAYS:
         raise RuntimeError("完美日预测的正式期天数不正确。")
+    if results[-1].day != rolling.YEAR_END:
+        raise RuntimeError("完美日预测的终端验收日期不是 12 月 31 日。")
+    if rolling.terminal_interval_error(results[-1].end_energy) > rolling.TERMINAL_TOLERANCE:
+        raise RuntimeError(
+            f"{results[-1].day} 完美日预测的实际年末储电量越界："
+            f"{results[-1].end_energy:.6f} kWh。"
+        )
     return results
 
 
@@ -710,7 +714,7 @@ def build_caliber_rows(
         ),
         row(
             "L1 全知日预测同策略",
-            "仅把逐日预测替换为当日实测，策略结构、约束与终端条件完全一致",
+            "仅把逐日预测替换为当日实测；12月31日仍用普通日末软目标，结束后验收实际末态",
             float(sum(np.sum(item.grid_purchase) for item in perfect_days)),
             float(sum(np.sum(item.emergency_purchase) for item in perfect_days)),
             float(sum(np.sum(item.curtailment) for item in perfect_days)),

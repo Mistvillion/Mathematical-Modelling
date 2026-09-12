@@ -1,16 +1,19 @@
-"""问题二：按日滚动预测购电，并在日内滚动调整储能。
+"""问题四（问题二部分）：波动电价下的购电与储能滚动调度。
 
 在 conda 环境 2026C 中运行：
-    python scripts_tables/2_rolling_optimization.py
+    python scripts_tables/4-2_price_rolling_optimization.py
 
-采用 docs/Q2.md 的负载上分位数、光伏下分位数预测，仅使用计划日前的数据。
-每天 0:00 只冻结当天 144 个时段的计划购电量；储能充放电量不冻结，日内每 10 分钟
-按“当前时段用实测、未来时段用 0:00 预测”的因果信息集滚动优化剩余时域的储能动作，
-只执行当前时段。充电只能来自“冻结购电量＋光伏”扣除负载后的盈余，放电只能用于
-负载缺口，因此充电与放电逐时段互斥，紧急购电也不会流入储能。所有日期（包括
-12 月 31 日）的日末储电量均按 0:00 已确定的惩罚系数 λE 计入软目标；全年执行
-结束后只检查 12 月 31 日实际储电量是否位于 [5400, 6600] kWh。
-CSV 写入 outputs/tables，正式工作簿写入 outputs/results/result2.xlsx。
+采用 docs/Q4-2.md 的模型：负载上分位数、光伏下分位数预测与价格“水平 × 形态”预测，
+三类预测均只使用计划日前的数据。附件 4 的逐日逐时段电价是实际发生值，计划日当天
+未知；附件 1 的电价曲线作为初始化前已知的参考价格曲线与冷启动先验。
+每天 0:00 用价格预测冻结当天 144 个时段的计划购电量；储能充放电量不冻结，日内每
+10 分钟按“当前时段用实测、未来时段用 0:00 预测”的因果信息集滚动优化剩余时域的
+储能动作，只执行当前时段。充电只能来自“冻结购电量＋光伏”扣除负载后的盈余，放电
+只能用于负载缺口，因此充放电逐时段互斥，紧急购电也不会流入储能。日末储电量按
+λE,d=max_t p̂(d,t) 计入软目标；实际结算使用当天实际电价：计划购电按 p(d,t)、
+紧急购电按 5p(d,t)。12 月 31 日与普通日期使用相同的日末软目标；全年结束后
+只判定实际储电量是否位于 [5400, 6600] kWh，计划末态仅用于诊断。
+CSV 写入 outputs/tables，正式工作簿写入 outputs/results/result4-2.xlsx。
 """
 
 from __future__ import annotations
@@ -21,7 +24,7 @@ import sys
 import tempfile
 from copy import copy
 from dataclasses import dataclass
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from functools import lru_cache
 from math import isfinite
 from pathlib import Path
@@ -36,18 +39,22 @@ from scipy.sparse import coo_matrix, lil_matrix
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 ATTACHMENT_DIR = PROJECT_DIR / "CUMCM 2026 C题" / "附件"
-PRICE_AND_PRIOR_FILE = ATTACHMENT_DIR / "附件1.xlsx"
+REFERENCE_PRICE_FILE = ATTACHMENT_DIR / "附件1.xlsx"
 ACTUAL_DATA_FILE = ATTACHMENT_DIR / "附件2.xlsx"
-RESULT_TEMPLATE_FILE = ATTACHMENT_DIR / "附件5" / "result2.xlsx"
+PRICE_DATA_FILE = ATTACHMENT_DIR / "附件4.xlsx"
+RESULT_TEMPLATE_FILE = ATTACHMENT_DIR / "附件5" / "result4-2.xlsx"
 OUTPUT_TABLE_DIR = PROJECT_DIR / "outputs" / "tables"
 OUTPUT_RESULT_DIR = PROJECT_DIR / "outputs" / "results"
-RESULT_FILE = OUTPUT_RESULT_DIR / "result2.xlsx"
+RESULT_FILE = OUTPUT_RESULT_DIR / "result4-2.xlsx"
 
-DETAIL_FILE = OUTPUT_TABLE_DIR / "2_滚动预测与调度明细.csv"
-PURCHASE_SUMMARY_FILE = OUTPUT_TABLE_DIR / "2_指定日期购电量及全天结果.csv"
-STORAGE_SUMMARY_FILE = OUTPUT_TABLE_DIR / "2_指定日期充放电量及储电量.csv"
-EMERGENCY_SUMMARY_FILE = OUTPUT_TABLE_DIR / "2_指定日期紧急购电量.csv"
-CHECK_FILE = OUTPUT_TABLE_DIR / "2_模型校验.csv"
+DETAIL_FILE = OUTPUT_TABLE_DIR / "4-2_滚动预测与调度明细.csv"
+PRICE_FORECAST_FILE = OUTPUT_TABLE_DIR / "4-2_电价预测与误差.csv"
+PURCHASE_SUMMARY_FILE = OUTPUT_TABLE_DIR / "4-2_指定日期购电量及全天结果.csv"
+STORAGE_SUMMARY_FILE = OUTPUT_TABLE_DIR / "4-2_指定日期充放电量及储电量.csv"
+EMERGENCY_SUMMARY_FILE = OUTPUT_TABLE_DIR / "4-2_指定日期紧急购电量.csv"
+CHECK_FILE = OUTPUT_TABLE_DIR / "4-2_模型校验.csv"
+DAILY_AUDIT_FILE = OUTPUT_TABLE_DIR / "4-2_每日运行审计.csv"
+TERMINAL_AUDIT_FILE = OUTPUT_TABLE_DIR / "4-2_年末终端偏差分解.csv"
 
 N_PERIODS = 144
 DELTA_T = 1 / 6
@@ -76,10 +83,26 @@ PHOTOVOLTAIC_QUANTILE = 0.2
 NET_LOAD_QUANTILE = 1.0 - 1.0 / EMERGENCY_PRICE_MULTIPLIER
 PHOTOVOLTAIC_NOISE_THRESHOLD = 1.0
 DECAY_DAY_CANDIDATES = (3.0, 5.0, 7.0, 10.0, 14.0, 21.0, 28.0, 42.0, 56.0, 84.0)
-# 日末储电量惩罚系数预先固定为 1.0 × max_t p_t：低价时段的购电成本（约 0.41 元/kWh）
-# 已低于该边际价值，因此日末软目标会把计划与实际储电量稳定拉回 E_REFERENCE，
-# 该系数不再逐日调参（原候选集在本题数据上完全退化，全部候选给出同一计划）。
-TERMINAL_PENALTY_MULTIPLIERS = (1.0,)
+
+# 价格“水平 × 形态”预测的候选集合与默认组合：
+# 水平项只用同星期几的日均价（周周期），形态项使用全部历史日期的指数加权平均。
+PRICE_LEVEL_WEIGHT_CANDIDATES = (
+    (1.0,),
+    (0.6, 0.3, 0.1),
+    (0.5, 0.3, 0.2),
+    (0.25, 0.25, 0.25, 0.25),
+)
+PRICE_SHAPE_DECAY_CANDIDATES = (7.0, 14.0, 21.0, 28.0)
+PRICE_CANDIDATE_COUNT = (
+    len(PRICE_LEVEL_WEIGHT_CANDIDATES) * len(PRICE_SHAPE_DECAY_CANDIDATES)
+)
+DEFAULT_PRICE_LEVEL_INDEX = 1
+DEFAULT_PRICE_SHAPE_INDEX = 1
+DEFAULT_PRICE_CANDIDATE_INDEX = (
+    DEFAULT_PRICE_LEVEL_INDEX * len(PRICE_SHAPE_DECAY_CANDIDATES)
+    + DEFAULT_PRICE_SHAPE_INDEX
+)
+
 # 参数候选、验证窗口、评分方式及默认参数均在初始化前固定。验证记录从
 # 第一个已经结束的日期开始积累；没有可用记录时由 choose_candidate 使用默认值。
 TUNING_START_INDEX = 0
@@ -122,7 +145,9 @@ class ModelData:
 
     dates: tuple[date, ...]
     interval_labels: tuple[str, ...]
-    price: np.ndarray
+    reference_price: np.ndarray
+    reference_price_level: float
+    actual_price: np.ndarray
     cold_start_load_energy: np.ndarray
     cold_start_photovoltaic_energy: np.ndarray
     actual_load_power: np.ndarray
@@ -137,6 +162,8 @@ class Hyperparameters:
 
     load_decay_days: float
     photovoltaic_decay_days: float
+    price_level_weights: tuple[float, ...]
+    price_shape_decay_days: float
     terminal_penalty: float
 
 
@@ -146,18 +173,21 @@ class TuningSummary:
 
     load_decay_scores: tuple[tuple[float, float], ...]
     photovoltaic_decay_scores: tuple[tuple[float, float], ...]
-    terminal_penalty_scores: tuple[tuple[float, float], ...]
+    price_candidate_scores: tuple[tuple[str, float], ...]
 
 
 @dataclass(frozen=True)
 class Forecast:
-    """某日在 0:00 可获得的风险修正预测。"""
+    """某日在 0:00 可获得的风险修正预测与价格预测。"""
 
     load_energy: np.ndarray
     photovoltaic_energy: np.ndarray
+    price: np.ndarray
+    price_level: float
     latest_training_date: date | None
     used_prior_load: bool = False
     used_prior_photovoltaic: bool = False
+    used_prior_price: bool = False
 
 
 @dataclass(frozen=True)
@@ -218,7 +248,9 @@ class DailyResult:
     replay: ReplayResult
     actual_load_energy: np.ndarray
     actual_photovoltaic_energy: np.ndarray
+    actual_price: np.ndarray
     planned_purchase_cost: float
+    forecast_planned_purchase_cost: float
     emergency_purchase_cost: float
     realized_total_cost: float
     hyperparameters: Hyperparameters
@@ -227,7 +259,7 @@ class DailyResult:
 
 @dataclass(frozen=True)
 class RollingResult:
-    """问题二完整滚动求解结果。"""
+    """问题四（问题二部分）完整滚动求解结果。"""
 
     hyperparameters: Hyperparameters
     tuning: TuningSummary
@@ -300,9 +332,20 @@ def validate_nonnegative_number(
     return float(value)
 
 
-def read_price_and_cold_start() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """只读加载附件 1 中的重复日内电价和冷启动曲线。"""
-    workbook = load_workbook(PRICE_AND_PRIOR_FILE, read_only=True, data_only=True)
+def validate_positive_number(
+    value: object,
+    location: str,
+) -> float:
+    """检查模型输入是否为有限正实数（电价不允许为零）。"""
+    number = validate_nonnegative_number(value, location)
+    if number <= 0:
+        raise ValueError(f"{location}应为有限正数，实际为：{value!r}")
+    return number
+
+
+def read_reference_price_and_cold_start() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """只读加载附件 1 的参考价格曲线和冷启动曲线。"""
+    workbook = load_workbook(REFERENCE_PRICE_FILE, read_only=True, data_only=True)
     try:
         if "Sheet1" not in workbook.sheetnames:
             raise ValueError("附件 1 缺少工作表 Sheet1。")
@@ -324,7 +367,7 @@ def read_price_and_cold_start() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 
     price = np.array(
         [
-            validate_nonnegative_number(row[1], f"附件 1 第 {row_index} 行电价")
+            validate_positive_number(row[1], f"附件 1 第 {row_index} 行电价")
             for row_index, row in enumerate(rows[1:], start=2)
         ],
         dtype=float,
@@ -403,11 +446,58 @@ def read_actual_sheet(
     return dates, end_minutes, power
 
 
-def load_model_data() -> ModelData:
-    """加载附件 1 和附件 2，并建立统一的 10 分钟时间轴。"""
-    price, cold_load_energy, cold_photovoltaic_energy = (
-        read_price_and_cold_start()
+def read_actual_price() -> tuple[tuple[date, ...], tuple[int, ...], np.ndarray]:
+    """校验并读取附件 4 的 365 天逐 10 分钟实际电价。"""
+    workbook = load_workbook(PRICE_DATA_FILE, read_only=True, data_only=True)
+    try:
+        if "Sheet1" not in workbook.sheetnames:
+            raise ValueError("附件 4 缺少工作表 Sheet1。")
+        rows = list(workbook["Sheet1"].iter_rows(values_only=True))
+    finally:
+        workbook.close()
+
+    if len(rows) != 366:
+        raise ValueError(
+            f"附件 4 应包含表头和 365 天数据，实际共有 {len(rows)} 行。"
+        )
+    if len(rows[0]) != N_PERIODS + 1 or rows[0][0] != "日期\\时间":
+        raise ValueError(
+            f"附件 4 首列应为“日期\\时间”，并包含 {N_PERIODS} 个时段。"
+        )
+    end_minutes = tuple(time_to_end_minutes(value) for value in rows[0][1:])
+    expected_end_minutes = tuple(range(10, 24 * 60 + 1, 10))
+    if end_minutes != expected_end_minutes:
+        raise ValueError("附件 4 的时间应从 0:10 到 0:00+1 连续排列。")
+
+    dates = tuple(
+        normalize_excel_date(row[0], f"附件 4 第 {row_index} 行日期")
+        for row_index, row in enumerate(rows[1:], start=2)
     )
+    expected_dates = tuple(
+        date.fromordinal(YEAR_START.toordinal() + day_offset)
+        for day_offset in range(365)
+    )
+    if dates != expected_dates:
+        raise ValueError(f"附件 4 的日期必须从 {YEAR_START} 连续到 {YEAR_END}。")
+
+    price = np.empty((365, N_PERIODS), dtype=float)
+    for day_index, row in enumerate(rows[1:]):
+        if len(row) != N_PERIODS + 1:
+            raise ValueError(f"附件 4 第 {day_index + 2} 行列数不正确。")
+        for period_index, value in enumerate(row[1:]):
+            price[day_index, period_index] = validate_positive_number(
+                value,
+                f"附件 4 第 {day_index + 2} 行第 {period_index + 2} 列电价",
+            )
+    return dates, end_minutes, price
+
+
+def load_model_data() -> ModelData:
+    """加载附件 1、附件 2 和附件 4，并建立统一的 10 分钟时间轴。"""
+    reference_price, cold_load_energy, cold_photovoltaic_energy = (
+        read_reference_price_and_cold_start()
+    )
+    price_dates, price_end_minutes, actual_price = read_actual_price()
 
     workbook = load_workbook(ACTUAL_DATA_FILE, read_only=True, data_only=True)
     try:
@@ -433,6 +523,10 @@ def load_model_data() -> ModelData:
         raise ValueError("附件 2 的负载和光伏工作表日期不一致。")
     if load_end_minutes != photovoltaic_end_minutes:
         raise ValueError("附件 2 的负载和光伏工作表时间表头不一致。")
+    if price_dates != load_dates:
+        raise ValueError("附件 4 的电价日期与附件 2 不一致。")
+    if price_end_minutes != load_end_minutes:
+        raise ValueError("附件 4 的电价时间表头与附件 2 不一致。")
 
     photovoltaic_power = photovoltaic_power.copy()
     photovoltaic_power[
@@ -445,7 +539,9 @@ def load_model_data() -> ModelData:
     return ModelData(
         dates=load_dates,
         interval_labels=interval_labels,
-        price=price,
+        reference_price=reference_price,
+        reference_price_level=float(np.mean(reference_price)),
+        actual_price=actual_price,
         cold_start_load_energy=cold_load_energy,
         cold_start_photovoltaic_energy=cold_photovoltaic_energy,
         actual_load_power=load_power,
@@ -458,6 +554,123 @@ def load_model_data() -> ModelData:
 def is_high_load_day(day: date) -> bool:
     """周日至周四为高负载类，周五、周六为低负载类。"""
     return day.weekday() <= 3 or day.weekday() == 6
+
+
+def normalized_price_shapes(historical_price: np.ndarray) -> np.ndarray:
+    """把逐日电价矩阵按日均价归一化为日内形态。"""
+    levels = np.asarray(historical_price, dtype=float).mean(axis=1)
+    if levels.shape != (len(historical_price),) or np.any(levels <= 0):
+        raise ValueError("历史电价日均价必须为正。")
+    return np.asarray(historical_price, dtype=float) / levels[:, None]
+
+
+def price_level_candidates(
+    target: date,
+    history_dates: Sequence[date],
+    historical_price: np.ndarray,
+    reference_level: float,
+) -> np.ndarray:
+    """给出各水平权重候选的同星期几日均价预测。"""
+    history_dates = tuple(history_dates)
+    if any(day >= target for day in history_dates):
+        raise ValueError("价格预测接口收到当天或未来日期，拒绝前视数据。")
+    if any(a >= b for a, b in zip(history_dates, history_dates[1:])):
+        raise ValueError("历史日期必须严格递增且无重复。")
+    historical_price = np.asarray(historical_price, dtype=float)
+    if historical_price.shape != (len(history_dates), N_PERIODS):
+        raise ValueError("历史电价样本数与日期数不一致。")
+    if not np.isfinite(historical_price).all() or np.any(historical_price <= 0):
+        raise ValueError("历史电价必须为有限正数。")
+    if not isfinite(reference_level) or reference_level <= 0:
+        raise ValueError("参考价格水平必须为有限正数。")
+
+    levels = historical_price.mean(axis=1)
+    position = {day: index for index, day in enumerate(history_dates)}
+    forecasts = []
+    for weights in PRICE_LEVEL_WEIGHT_CANDIDATES:
+        numerator = 0.0
+        denominator = 0.0
+        for week_offset, weight in enumerate(weights, start=1):
+            same_weekday = target - timedelta(days=7 * week_offset)
+            index = position.get(same_weekday)
+            if index is None:
+                continue
+            numerator += weight * levels[index]
+            denominator += weight
+        forecasts.append(
+            numerator / denominator if denominator > 0 else reference_level
+        )
+    return np.asarray(forecasts, dtype=float)
+
+
+def price_shape_candidates(
+    target: date,
+    history_dates: Sequence[date],
+    historical_price: np.ndarray,
+    reference_shape: np.ndarray,
+) -> np.ndarray:
+    """给出各形态衰减候选的归一化日内形态预测。"""
+    reference_shape = np.asarray(reference_shape, dtype=float)
+    if reference_shape.shape != (N_PERIODS,) or np.any(reference_shape <= 0):
+        raise ValueError("参考价格形态必须为 144 个正数。")
+    if not len(history_dates):
+        return np.tile(reference_shape, (len(PRICE_SHAPE_DECAY_CANDIDATES), 1))
+    ages = np.array([(target - day).days for day in history_dates], dtype=float)
+    shapes = normalized_price_shapes(historical_price)
+    forecasts = []
+    for decay_days in PRICE_SHAPE_DECAY_CANDIDATES:
+        weights = np.exp(-ages / decay_days)
+        shape = weights @ shapes / weights.sum()
+        forecasts.append(shape / shape.mean())
+    return np.stack(forecasts)
+
+
+def price_candidates(
+    target: date,
+    history_dates: Sequence[date],
+    historical_price: np.ndarray,
+    reference_price: np.ndarray,
+) -> np.ndarray:
+    """返回 (水平候选 × 形态候选, 144) 的价格预测候选矩阵。"""
+    reference_price = np.asarray(reference_price, dtype=float)
+    if reference_price.shape != (N_PERIODS,) or np.any(reference_price <= 0):
+        raise ValueError("参考价格曲线必须为 144 个正数。")
+    reference_level = float(np.mean(reference_price))
+    reference_shape = reference_price / reference_level
+    levels = price_level_candidates(
+        target, history_dates, historical_price, reference_level
+    )
+    shapes = price_shape_candidates(
+        target, history_dates, historical_price, reference_shape
+    )
+    candidates = np.stack(
+        [level * shape for level in levels for shape in shapes]
+    )
+    if candidates.shape != (PRICE_CANDIDATE_COUNT, N_PERIODS):
+        raise RuntimeError("价格候选矩阵形状不正确。")
+    if not np.isfinite(candidates).all() or np.any(candidates <= 0):
+        raise RuntimeError("价格候选矩阵必须为有限正数。")
+    return candidates
+
+
+def price_candidate_labels() -> tuple[str, ...]:
+    """价格候选组合的文字标签，用于审计与校验输出。"""
+    return tuple(
+        f"水平{'-'.join(f'{weight:g}' for weight in weights)}×形态{decay_days:g}天"
+        for weights in PRICE_LEVEL_WEIGHT_CANDIDATES
+        for decay_days in PRICE_SHAPE_DECAY_CANDIDATES
+    )
+
+
+def price_candidate_indices(candidate_index: int) -> tuple[tuple[float, ...], float]:
+    """把候选序号拆成水平权重与形态衰减天数。"""
+    if not 0 <= candidate_index < PRICE_CANDIDATE_COUNT:
+        raise ValueError("价格候选序号超出范围。")
+    shape_count = len(PRICE_SHAPE_DECAY_CANDIDATES)
+    return (
+        PRICE_LEVEL_WEIGHT_CANDIDATES[candidate_index // shape_count],
+        PRICE_SHAPE_DECAY_CANDIDATES[candidate_index % shape_count],
+    )
 
 
 class ForecastEngine:
@@ -655,11 +868,11 @@ def terminal_interval_error(energy: float) -> float:
     return float(max(E_TERMINAL_MIN - energy, energy - E_TERMINAL_MAX, 0.0))
 
 
-@lru_cache(maxsize=2)
-def dispatch_matrix(hard_terminal: bool):
+@lru_cache(maxsize=1)
+def dispatch_matrix():
     """每个进程只构造一次固定稀疏系数矩阵；逐日只更新边界与右端项。"""
     n = N_PERIODS
-    matrix = lil_matrix((4 * n + (not hard_terminal), 6 * n + 3), dtype=float)
+    matrix = lil_matrix((4 * n + 1, 6 * n + 3), dtype=float)
     for t in range(n):
         matrix[t, t] = 1.0
         matrix[t, n + t] = -1.0
@@ -673,21 +886,19 @@ def dispatch_matrix(hard_terminal: bool):
         matrix[2 * n + t, 4 * n + t] = -CHARGE_LIMIT
         matrix[3 * n + t, 2 * n + t] = 1.0
         matrix[3 * n + t, 4 * n + t] = DISCHARGE_LIMIT
-    if not hard_terminal:
-        matrix[4 * n, 6 * n] = 1.0
-        matrix[4 * n, 6 * n + 1] = -1.0
-        matrix[4 * n, 6 * n + 2] = 1.0
+    matrix[4 * n, 6 * n] = 1.0
+    matrix[4 * n, 6 * n + 1] = -1.0
+    matrix[4 * n, 6 * n + 2] = 1.0
     csc = matrix.tocsc()
-    equality_rows = list(range(2 * n)) + ([] if hard_terminal else [4 * n])
+    equality_rows = list(range(2 * n)) + [4 * n]
     return csc, csc[equality_rows, :], csc[2 * n : 4 * n, :]
 
 
 def solve_daily_plan(
-    price: np.ndarray,
+    predicted_price: np.ndarray,
     forecast: Forecast,
     initial_energy: float,
     terminal_penalty: float,
-    require_terminal_interval: bool,
     force_milp: bool = False,
 ) -> PlanResult:
     """先用 LP 下界验证最优性；互斥不成立才求解完整 MILP。
@@ -695,6 +906,7 @@ def solve_daily_plan(
     只重建无成本的模式 u，不对连续能量决策做取整。当 LP 最优解本身
     满足所有原 MILP 约束，其目标既是可行上界也是松弛下界，故可接受。
     禁止不加检查地删除二元变量或用启发式解冒充最优解。
+    目标中的购电系数是当天 0:00 的价格预测，不是当天实际电价。
     """
     validate_terminal_bounds()
     if not E_MIN - BOUND_TOLERANCE <= initial_energy <= E_MAX + BOUND_TOLERANCE:
@@ -712,10 +924,9 @@ def solve_daily_plan(
     variable_count = 6 * N_PERIODS + 3
 
     objective = np.zeros(variable_count)
-    objective[offset_grid : offset_grid + N_PERIODS] = price
-    if not require_terminal_interval:
-        objective[offset_positive_deviation] = terminal_penalty
-        objective[offset_negative_deviation] = terminal_penalty
+    objective[offset_grid : offset_grid + N_PERIODS] = predicted_price
+    objective[offset_positive_deviation] = terminal_penalty
+    objective[offset_negative_deviation] = terminal_penalty
 
     lower_bounds = np.zeros(variable_count)
     upper_bounds = np.full(variable_count, np.inf)
@@ -732,18 +943,11 @@ def solve_daily_plan(
     lower_bounds[offset_energy] = initial_energy
     upper_bounds[offset_energy] = initial_energy
 
-    if require_terminal_interval:
-        lower_bounds[offset_energy + N_PERIODS] = E_TERMINAL_MIN
-        upper_bounds[offset_energy + N_PERIODS] = E_TERMINAL_MAX
-        upper_bounds[offset_positive_deviation] = 0.0
-        upper_bounds[offset_negative_deviation] = 0.0
-
     integrality = np.zeros(variable_count, dtype=int)
     integrality[offset_mode : offset_mode + N_PERIODS] = 1
 
-    terminal_constraint_count = 0 if require_terminal_interval else 1
-    constraint_count = 4 * N_PERIODS + terminal_constraint_count
-    matrix, equality_matrix, inequality_matrix = dispatch_matrix(require_terminal_interval)
+    constraint_count = 4 * N_PERIODS + 1
+    matrix, equality_matrix, inequality_matrix = dispatch_matrix()
     constraint_lower = np.full(constraint_count, -np.inf)
     constraint_upper = np.full(constraint_count, np.inf)
 
@@ -766,17 +970,16 @@ def solve_daily_plan(
         discharge_mode_row = 3 * N_PERIODS + period_index
         constraint_upper[discharge_mode_row] = DISCHARGE_LIMIT
 
-    if not require_terminal_interval:
-        terminal_row = 4 * N_PERIODS
-        constraint_lower[terminal_row] = E_REFERENCE
-        constraint_upper[terminal_row] = E_REFERENCE
+    terminal_row = 4 * N_PERIODS
+    constraint_lower[terminal_row] = E_REFERENCE
+    constraint_upper[terminal_row] = E_REFERENCE
 
     solver_kind = "MILP"
     result = None
     if not force_milp:
         equality_rhs = np.concatenate([
             constraint_lower[:2 * N_PERIODS],
-            np.array([] if require_terminal_interval else [E_REFERENCE]),
+            np.array([E_REFERENCE]),
         ])
         relaxed = linprog(
             c=objective,
@@ -843,7 +1046,8 @@ def solve_daily_plan(
 
 def solve_intraday_step(
     period_index: int,
-    price: np.ndarray,
+    actual_price: np.ndarray,
+    predicted_price: np.ndarray,
     plan: PlanResult,
     forecast: Forecast,
     actual_load_now: float,
@@ -853,11 +1057,11 @@ def solve_intraday_step(
 ) -> IntradayStep:
     """求解从当前时段到日末的剩余时域 LP，返回本时段实际执行的动作。
 
-    当前时段使用实测负载与实测光伏，未来时段只使用 0:00 已保存的预测，
-    因此日内决策是因果的。充电量上界取“冻结购电量＋光伏”扣除负载后的盈余，
-    放电量上界取负载扣除冻结购电与光伏后的缺口：两个上界不会同时为正，
+    当前时段使用实测负载、实测光伏与实际电价，未来时段只使用 0:00 已保存的
+    预测，因此日内决策是因果的。充电量上界取“冻结购电量＋光伏”扣除负载后的
+    盈余，放电量上界取负载扣除冻结购电与光伏后的缺口：两个上界不会同时为正，
     故充放电天然互斥，且紧急购电（只补缺口）不会流入储能。
-    目标为剩余紧急购电费与日末储电量偏离 E_REFERENCE 的惩罚之和。
+    目标中当期紧急购电用实际电价、未来时段用价格预测。
     """
     if not 0 <= period_index < N_PERIODS:
         raise ValueError("日内滚动的时段索引超出范围。")
@@ -865,14 +1069,24 @@ def solve_intraday_step(
         raise ValueError("日内滚动的初始储电量超出设备安全范围。")
     if not isfinite(terminal_penalty) or terminal_penalty < 0:
         raise ValueError("日末储电量惩罚系数必须为有限非负数。")
-    for values in (price, plan.grid_purchase, forecast.load_energy, forecast.photovoltaic_energy):
+    for values in (
+        actual_price,
+        predicted_price,
+        plan.grid_purchase,
+        forecast.load_energy,
+        forecast.photovoltaic_energy,
+    ):
         if values.shape != (N_PERIODS,) or not np.isfinite(values).all() or np.any(values < 0):
             raise ValueError("日内滚动的电价、冻结购电量和预测值须为 144 个有限非负数。")
-    if np.any(price <= 0):
-        raise ValueError("日内滚动模型要求电价严格为正。")
+    if np.any(actual_price <= 0) or np.any(predicted_price <= 0):
+        raise ValueError("日内滚动模型要求实际电价与预测电价严格为正。")
 
     horizon = N_PERIODS - period_index
-    price_h = np.asarray(price[period_index:], dtype=float)
+    # 当期用已揭晓的实际电价，未来用 0:00 保存的价格预测。
+    price_h = np.concatenate((
+        np.asarray(actual_price[period_index : period_index + 1], dtype=float),
+        np.asarray(predicted_price[period_index + 1 :], dtype=float),
+    ))
     planned_h = np.asarray(plan.grid_purchase[period_index:], dtype=float)
     load_h = np.asarray(forecast.load_energy[period_index:], dtype=float).copy()
     photovoltaic_h = np.asarray(
@@ -1019,7 +1233,8 @@ def solve_intraday_step(
 
 
 def replay_actual_day(
-    price: np.ndarray,
+    actual_price: np.ndarray,
+    predicted_price: np.ndarray,
     plan: PlanResult,
     forecast: Forecast,
     actual_load_energy: np.ndarray,
@@ -1027,7 +1242,7 @@ def replay_actual_day(
     initial_energy: float,
     terminal_penalty: float,
 ) -> ReplayResult:
-    """购电量冻结，储能按日内滚动优化逐时段执行。"""
+    """购电量冻结，储能按日内滚动优化逐时段执行，当期用实际电价。"""
     charge = np.zeros(N_PERIODS)
     discharge = np.zeros(N_PERIODS)
     emergency_purchase = np.zeros(N_PERIODS)
@@ -1040,7 +1255,8 @@ def replay_actual_day(
     for period_index in range(N_PERIODS):
         step = solve_intraday_step(
             period_index,
-            price,
+            actual_price,
+            predicted_price,
             plan,
             forecast,
             float(actual_load_energy[period_index]),
@@ -1076,7 +1292,6 @@ def validate_plan(
     forecast: Forecast,
     plan: PlanResult,
     initial_energy: float,
-    require_terminal_interval: bool,
 ) -> None:
     """独立检查计划阶段 MILP 的主要约束。"""
     for name in ("grid_purchase", "charge", "discharge", "curtailment", "mode", "stored_energy"):
@@ -1087,8 +1302,18 @@ def validate_plan(
     for array in (forecast.load_energy, forecast.photovoltaic_energy):
         if array.shape != (N_PERIODS,) or not np.isfinite(array).all() or np.any(array < 0):
             raise RuntimeError(f"{day} 预测值形状或数值无效。")
+    if (
+        forecast.price.shape != (N_PERIODS,)
+        or not np.isfinite(forecast.price).all()
+        or np.any(forecast.price <= 0)
+    ):
+        raise RuntimeError(f"{day} 价格预测形状或数值无效。")
+    if not isfinite(forecast.price_level) or forecast.price_level <= 0:
+        raise RuntimeError(f"{day} 价格水平预测无效。")
     if not isinstance(forecast.used_prior_load, bool) or not isinstance(forecast.used_prior_photovoltaic, bool):
         raise RuntimeError(f"{day} 预测先验回退标记无效。")
+    if not isinstance(forecast.used_prior_price, bool):
+        raise RuntimeError(f"{day} 价格先验回退标记无效。")
     if not all(isfinite(value) for value in (
         plan.positive_terminal_deviation, plan.negative_terminal_deviation,
         plan.objective_value, plan.mip_gap,
@@ -1149,18 +1374,14 @@ def validate_plan(
     ):
         failures.append("计划弃光量超过预测光伏电量")
 
-    if require_terminal_interval:
-        if terminal_interval_error(plan.stored_energy[-1]) > TERMINAL_TOLERANCE:
-            failures.append("最终日计划储电量超出年末允许区间")
-    else:
-        terminal_deviation_residual = (
-            plan.stored_energy[-1]
-            - E_REFERENCE
-            - plan.positive_terminal_deviation
-            + plan.negative_terminal_deviation
-        )
-        if abs(terminal_deviation_residual) > BALANCE_TOLERANCE:
-            failures.append("日末储电量偏差线性化残差超限")
+    terminal_deviation_residual = (
+        plan.stored_energy[-1]
+        - E_REFERENCE
+        - plan.positive_terminal_deviation
+        + plan.negative_terminal_deviation
+    )
+    if abs(terminal_deviation_residual) > BALANCE_TOLERANCE:
+        failures.append("日末储电量偏差线性化残差超限")
 
     if failures:
         raise RuntimeError(f"{day} 计划模型校验失败：" + "；".join(failures))
@@ -1263,16 +1484,16 @@ def validate_replay(
 
 
 def solve_validated_plan(
-    day: date, price: np.ndarray, forecast: Forecast, initial: float,
-    penalty: float, hard_terminal: bool,
+    day: date, predicted_price: np.ndarray, forecast: Forecast, initial: float,
+    penalty: float,
 ) -> PlanResult:
-    """求解并校验日前计划；输入不含当天实际负载或光伏。"""
+    """求解并校验日前计划；输入不含当天实际负载、光伏或电价。"""
     try:
-        plan = solve_daily_plan(price, forecast, initial, penalty, hard_terminal)
-        validate_plan(day, forecast, plan, initial, hard_terminal)
-        expected = float(price @ plan.grid_purchase)
-        if not hard_terminal:
-            expected += penalty * (plan.positive_terminal_deviation + plan.negative_terminal_deviation)
+        plan = solve_daily_plan(predicted_price, forecast, initial, penalty)
+        validate_plan(day, forecast, plan, initial)
+        expected = float(predicted_price @ plan.grid_purchase) + penalty * (
+            plan.positive_terminal_deviation + plan.negative_terminal_deviation
+        )
         if abs(plan.objective_value - expected) > BALANCE_TOLERANCE:
             raise RuntimeError("目标函数重算不一致。")
         return plan
@@ -1281,14 +1502,12 @@ def solve_validated_plan(
 
 
 def solve_rolling_model(data: ModelData, engine: ForecastEngine) -> RollingResult:
-    """逐日预测并冻结购电量，日内滚动调整储能，日末才更新实际状态与历史。"""
-    penalties = np.max(data.price) * np.asarray(TERMINAL_PENALTY_MULTIPLIERS)
-    default_penalty = TERMINAL_PENALTY_MULTIPLIERS.index(1.0)
+    """逐日预测负载、光伏与电价，冻结购电量，日内滚动调整储能并实际结算。"""
     default_decay = DECAY_DAY_CANDIDATES.index(DEFAULT_DECAY_DAYS)
-    terminal_value = float(np.max(data.price) / ETA_CHARGE)
+    default_price_index = DEFAULT_PRICE_CANDIDATE_INDEX
     losses_load: list[np.ndarray] = []
     losses_pv: list[np.ndarray] = []
-    losses_penalty: list[np.ndarray] = []
+    losses_price: list[np.ndarray] = []
     results: list[DailyResult] = []
     initial_energy = E_INITIAL
 
@@ -1296,68 +1515,76 @@ def solve_rolling_model(data: ModelData, engine: ForecastEngine) -> RollingResul
         history_dates = data.dates[:day_index]
         load_scores = historical_scores(losses_load, day_index, len(DECAY_DAY_CANDIDATES), data.dates, True)
         pv_scores = historical_scores(losses_pv, day_index, len(DECAY_DAY_CANDIDATES), data.dates)
-        penalty_scores = historical_scores(losses_penalty, day_index, len(penalties), data.dates)
+        price_scores = historical_scores(losses_price, day_index, PRICE_CANDIDATE_COUNT, data.dates)
         load_index = choose_candidate(load_scores, default_decay)
         pv_index = choose_candidate(pv_scores, default_decay)
-        penalty_index = choose_candidate(penalty_scores, default_penalty)
+        price_index = choose_candidate(price_scores, default_price_index)
         parameter_latest = parameter_validation_latest_date(
-            ((losses_load, True), (losses_pv, False), (losses_penalty, False)),
+            ((losses_load, True), (losses_pv, False), (losses_price, False)),
             day_index, data.dates,
-        )
-        parameters = Hyperparameters(
-            DECAY_DAY_CANDIDATES[load_index], DECAY_DAY_CANDIDATES[pv_index],
-            float(penalties[penalty_index]),
         )
         load_candidates, pv_candidates = engine.candidates(
             day, history_dates, data.actual_load_energy[:day_index],
             data.actual_photovoltaic_energy[:day_index],
             data.cold_start_load_energy, data.cold_start_photovoltaic_energy,
         )
-        prior_load, prior_pv = engine.prior_fallback_flags(day, history_dates)
-        forecast = Forecast(
-            load_candidates[load_index], pv_candidates[pv_index],
-            engine.latest_training_date(day, history_dates), prior_load, prior_pv,
+        price_candidate_matrix = price_candidates(
+            day, history_dates, data.actual_price[:day_index], data.reference_price,
         )
-        # 12 月 31 日与普通日期完全相同，计划层仍使用日末软目标；
-        # 5400–6600 kWh 仅在全年实际执行结束后作一次终端验收。
-        plans = [
-            solve_validated_plan(day, data.price, forecast, initial_energy, float(penalty), False)
-            for penalty in penalties
-        ]
-        selected_plan = plans[penalty_index]
+        prior_load, prior_pv = engine.prior_fallback_flags(day, history_dates)
+        price_level_weights, price_shape_decay = price_candidate_indices(price_index)
+        selected_price = price_candidate_matrix[price_index]
+        day_penalty = float(np.max(selected_price))
+        parameters = Hyperparameters(
+            load_decay_days=DECAY_DAY_CANDIDATES[load_index],
+            photovoltaic_decay_days=DECAY_DAY_CANDIDATES[pv_index],
+            price_level_weights=price_level_weights,
+            price_shape_decay_days=price_shape_decay,
+            terminal_penalty=day_penalty,
+        )
+        forecast = Forecast(
+            load_energy=load_candidates[load_index],
+            photovoltaic_energy=pv_candidates[pv_index],
+            price=selected_price,
+            price_level=float(np.mean(selected_price)),
+            latest_training_date=engine.latest_training_date(day, history_dates),
+            used_prior_load=prior_load,
+            used_prior_photovoltaic=prior_pv,
+            used_prior_price=not bool(history_dates),
+        )
+        # 计划阶段只使用 0:00 的三类预测，不读取当天任何实测。
+        plan = solve_validated_plan(
+            day, selected_price, forecast, initial_energy, day_penalty
+        )
 
-        # 选定并冻结 selected_plan 后才读取当天实测；各候选共用相同实际日初状态。
+        # 选定并冻结计划后才读取当天实测；实际电价在对应时段开始时才进入日内决策。
         actual_load = data.actual_load_energy[day_index]
         actual_pv = data.actual_photovoltaic_energy[day_index]
-        replays = [
-            replay_actual_day(
-                data.price, plan, forecast, actual_load, actual_pv,
-                initial_energy, float(penalty),
-            )
-            for plan, penalty in zip(plans, penalties)
-        ]
-        for plan, replay in zip(plans, replays):
-            validate_replay(day, plan, replay, actual_load, actual_pv)
-        planned_costs = np.array([float(data.price @ plan.grid_purchase) for plan in plans])
-        emergency_costs = np.array([
-            float(EMERGENCY_PRICE_MULTIPLIER * (data.price @ replay.emergency_purchase))
-            for replay in replays
-        ])
-        realized_costs = planned_costs + emergency_costs
+        actual_price = data.actual_price[day_index]
+        replay = replay_actual_day(
+            actual_price, selected_price, plan, forecast,
+            actual_load, actual_pv, initial_energy, day_penalty,
+        )
+        validate_replay(day, plan, replay, actual_load, actual_pv)
+        planned_cost = float(actual_price @ plan.grid_purchase)
+        forecast_planned_cost = float(selected_price @ plan.grid_purchase)
+        emergency_cost = float(
+            EMERGENCY_PRICE_MULTIPLIER * (actual_price @ replay.emergency_purchase)
+        )
         result = DailyResult(
-            day=day, forecast=forecast, plan=selected_plan, replay=replays[penalty_index],
+            day=day, forecast=forecast, plan=plan, replay=replay,
             actual_load_energy=actual_load, actual_photovoltaic_energy=actual_pv,
-            planned_purchase_cost=float(planned_costs[penalty_index]),
-            emergency_purchase_cost=float(emergency_costs[penalty_index]),
-            realized_total_cost=float(realized_costs[penalty_index]),
+            actual_price=actual_price,
+            planned_purchase_cost=planned_cost,
+            forecast_planned_purchase_cost=forecast_planned_cost,
+            emergency_purchase_cost=emergency_cost,
+            realized_total_cost=planned_cost + emergency_cost,
             hyperparameters=parameters, parameter_latest_date=parameter_latest,
         )
         for loss, history in (
             (np.array([pinball_loss(actual_load, item, LOAD_QUANTILE) for item in load_candidates]), losses_load),
             (np.array([pinball_loss(actual_pv, item, PHOTOVOLTAIC_QUANTILE) for item in pv_candidates]), losses_pv),
-            (realized_costs + terminal_value * np.array([
-                abs(replay.stored_energy[-1] - E_REFERENCE) for replay in replays
-            ]), losses_penalty),
+            (np.mean(np.abs(price_candidate_matrix - actual_price[None, :]), axis=1), losses_price),
         ):
             if not np.isfinite(loss).all() or np.any(loss < 0):
                 raise RuntimeError(f"{day} 的候选验证损失无效。")
@@ -1370,7 +1597,7 @@ def solve_rolling_model(data: ModelData, engine: ForecastEngine) -> RollingResul
         tuning=TuningSummary(
             load_decay_scores=tuple(zip(DECAY_DAY_CANDIDATES, load_scores)),
             photovoltaic_decay_scores=tuple(zip(DECAY_DAY_CANDIDATES, pv_scores)),
-            terminal_penalty_scores=tuple(zip(map(float, penalties), map(float, penalty_scores))),
+            price_candidate_scores=tuple(zip(price_candidate_labels(), price_scores)),
         ),
         warmup_days=tuple(results[:JANUARY_DAYS]),
         official_days=tuple(results[JANUARY_DAYS:]),
@@ -1443,7 +1670,11 @@ def write_detail_csv(
         "参数验证最晚日期",
         "负载预测来源",
         "光伏预测来源",
-        "电价（元/kWh）",
+        "电价预测来源",
+        "价格水平权重",
+        "价格形态衰减天数",
+        "预测电价（元/kWh）",
+        "实际电价（元/kWh）",
         "预测负载电量（kWh）",
         "预测光伏电量（kWh）",
         "实际负载电量（kWh）",
@@ -1481,14 +1712,16 @@ def write_detail_csv(
             )
             load_source = "附件1冷启动先验" if result.forecast.used_prior_load else "历史实测分位数"
             pv_source = "附件1冷启动先验" if result.forecast.used_prior_photovoltaic else "历史实测分位数"
+            price_source = "附件1参考曲线" if result.forecast.used_prior_price else "历史实际电价"
+            price_weights = "-".join(
+                f"{weight:g}" for weight in result.hyperparameters.price_level_weights
+            )
             for period_index, interval_label in enumerate(data.interval_labels):
-                planned_cost = (
-                    data.price[period_index]
-                    * result.plan.grid_purchase[period_index]
-                )
+                actual_price = result.actual_price[period_index]
+                planned_cost = actual_price * result.plan.grid_purchase[period_index]
                 emergency_cost = (
                     EMERGENCY_PRICE_MULTIPLIER
-                    * data.price[period_index]
+                    * actual_price
                     * result.replay.emergency_purchase[period_index]
                 )
                 yield (
@@ -1498,7 +1731,11 @@ def write_detail_csv(
                     parameter_latest_date,
                     load_source,
                     pv_source,
-                    display_number(data.price[period_index]),
+                    price_source,
+                    price_weights,
+                    f"{result.hyperparameters.price_shape_decay_days:g}",
+                    display_number(result.forecast.price[period_index]),
+                    display_number(actual_price),
                     display_number(result.forecast.load_energy[period_index]),
                     display_number(
                         result.forecast.photovoltaic_energy[period_index]
@@ -1578,7 +1815,14 @@ def write_purchase_summary_csv(
                 ),
                 (
                     specified_day.isoformat(),
-                    "全天购电费（含紧急购电）",
+                    "全天的计划购电费（预测电价口径）",
+                    "00:00-24:00",
+                    display_number(result.forecast_planned_purchase_cost),
+                    "元",
+                ),
+                (
+                    specified_day.isoformat(),
+                    "全天购电费（含紧急购电，实际电价结算）",
                     "00:00-24:00",
                     display_number(result.realized_total_cost),
                     "元",
@@ -1590,6 +1834,56 @@ def write_purchase_summary_csv(
         ("日期", "指标", "时间段", "数值", "单位"),
         rows,
     )
+
+
+def write_price_forecast_csv(
+    data: ModelData,
+    rolling: RollingResult,
+) -> Path:
+    """写出 365 天逐时段的电价预测、实际电价、误差与所选价格预测参数。"""
+    header = (
+        "日期",
+        "阶段",
+        "时间段",
+        "训练样本最晚日期",
+        "价格预测来源",
+        "价格水平权重",
+        "价格形态衰减天数",
+        "价格预测水平（元/kWh）",
+        "预测电价（元/kWh）",
+        "实际电价（元/kWh）",
+        "绝对误差（元/kWh）",
+    )
+
+    def rows() -> Iterable[Sequence[object]]:
+        for day in rolling.warmup_days + rolling.official_days:
+            latest_training_date = (
+                day.forecast.latest_training_date.isoformat()
+                if day.forecast.latest_training_date is not None
+                else "附件1冷启动"
+            )
+            price_source = "附件1参考曲线" if day.forecast.used_prior_price else "历史实际电价"
+            price_weights = "-".join(
+                f"{weight:g}" for weight in day.hyperparameters.price_level_weights
+            )
+            for period_index, interval_label in enumerate(data.interval_labels):
+                forecast_price = day.forecast.price[period_index]
+                actual_price = day.actual_price[period_index]
+                yield (
+                    day.day.isoformat(),
+                    "初始化" if day.day < OFFICIAL_START else "正式期",
+                    interval_label,
+                    latest_training_date,
+                    price_source,
+                    price_weights,
+                    f"{day.hyperparameters.price_shape_decay_days:g}",
+                    display_number(day.forecast.price_level),
+                    display_number(forecast_price),
+                    display_number(actual_price),
+                    display_number(abs(actual_price - forecast_price)),
+                )
+
+    return write_csv(PRICE_FORECAST_FILE, header, rows())
 
 
 def write_storage_summary_csv(
@@ -1708,6 +2002,8 @@ def build_check_rows(
     actual_photovoltaic = np.concatenate(
         [result.actual_photovoltaic_energy for result in results]
     )
+    forecast_price = concatenate_result_array(results, "forecast", "price")
+    actual_price = np.concatenate([result.actual_price for result in results])
     planned_purchase = concatenate_result_array(
         results, "plan", "grid_purchase"
     )
@@ -1785,6 +2081,9 @@ def build_check_rows(
         for result in results
     )
     planned_cost = sum(result.planned_purchase_cost for result in results)
+    forecast_planned_cost = sum(
+        result.forecast_planned_purchase_cost for result in results
+    )
     emergency_cost = sum(result.emergency_purchase_cost for result in results)
     total_cost = planned_cost + emergency_cost
 
@@ -1807,7 +2106,24 @@ def build_check_rows(
         ),
         (
             "超参数",
-            "最终日使用的日末储电量软惩罚系数",
+            "最终日价格水平权重",
+            "-".join(
+                f"{weight:g}"
+                for weight in rolling_result.hyperparameters.price_level_weights
+            ),
+            "无量纲",
+            "通过",
+        ),
+        (
+            "超参数",
+            "最终日价格形态衰减天数",
+            f"{rolling_result.hyperparameters.price_shape_decay_days:g}",
+            "天",
+            "通过",
+        ),
+        (
+            "超参数",
+            "最终日的日末储电量惩罚系数（当日价格预测最大值）",
             display_number(rolling_result.hyperparameters.terminal_penalty),
             "元/kWh",
             "通过",
@@ -1876,6 +2192,22 @@ def build_check_rows(
         ),
         (
             "预测",
+            "电价 MAE",
+            display_number(float(np.mean(np.abs(actual_price - forecast_price)))),
+            "元/kWh",
+            "参考",
+        ),
+        (
+            "预测",
+            "电价 RMSE",
+            display_number(
+                float(np.sqrt(np.mean((actual_price - forecast_price) ** 2)))
+            ),
+            "元/kWh",
+            "参考",
+        ),
+        (
+            "预测",
             "负载使用附件1冷启动先验的正式天数",
             str(sum(day.forecast.used_prior_load for day in results)),
             "天",
@@ -1885,6 +2217,13 @@ def build_check_rows(
             "预测",
             "光伏使用附件1冷启动先验的正式天数",
             str(sum(day.forecast.used_prior_photovoltaic for day in results)),
+            "天",
+            "参考",
+        ),
+        (
+            "预测",
+            "电价使用附件1参考曲线的正式天数",
+            str(sum(day.forecast.used_prior_price for day in results)),
             "天",
             "参考",
         ),
@@ -1996,8 +2335,22 @@ def build_check_rows(
         ),
         (
             "费用",
-            "计划购电费",
+            "计划购电费（实际电价结算）",
             display_number(planned_cost),
+            "元",
+            "参考",
+        ),
+        (
+            "费用",
+            "计划购电费（预测电价口径）",
+            display_number(forecast_planned_cost),
+            "元",
+            "参考",
+        ),
+        (
+            "费用",
+            "价格预测导致的计划购电费偏差（实际−预测）",
+            display_number(planned_cost - forecast_planned_cost),
             "元",
             "参考",
         ),
@@ -2079,13 +2432,13 @@ def build_check_rows(
                 "参考",
             )
         )
-    for penalty, score in rolling_result.tuning.terminal_penalty_scores:
+    for label, score in rolling_result.tuning.price_candidate_scores:
         rows.append(
             (
                 "超参数验证",
-                f"12月31日前滚动验证：日末惩罚 {penalty:.6f} 元/kWh 的单步评分",
+                f"12月31日前滚动验证：{label} 的电价 MAE",
                 display_number(score),
-                "元",
+                "元/kWh",
                 "参考",
             )
         )
@@ -2136,11 +2489,11 @@ def validate_result_template(
     workbook: object,
     official_results: Sequence[DailyResult],
 ) -> None:
-    """在写入前核对 result2.xlsx 的工作表、日期和关键表头。"""
+    """在写入前核对 result4-2.xlsx 的工作表、日期和关键表头。"""
     missing_sheets = set(RESULT_SHEET_NAMES).difference(workbook.sheetnames)
     if missing_sheets:
         raise ValueError(
-            "result2.xlsx 模板缺少工作表：" + "、".join(sorted(missing_sheets))
+            "result4-2.xlsx 模板缺少工作表：" + "、".join(sorted(missing_sheets))
         )
 
     purchase_sheet = workbook["计划购电量"]
@@ -2341,9 +2694,8 @@ def write_result_workbook(rolling_result: RollingResult) -> Path:
     """从原始模板生成临时工作簿，回读校验后原子替换正式文件。"""
     if len(rolling_result.official_days) != OFFICIAL_DAYS:
         raise RuntimeError("正式日期不足334天，禁止发布结果工作簿。")
-    require_terminal_interval(rolling_result.official_days[-1])
     if not RESULT_TEMPLATE_FILE.exists():
-        raise FileNotFoundError(f"未找到问题二结果模板：{RESULT_TEMPLATE_FILE}")
+        raise FileNotFoundError(f"未找到问题四（问题二部分）结果模板：{RESULT_TEMPLATE_FILE}")
     OUTPUT_RESULT_DIR.mkdir(parents=True, exist_ok=True)
     workbook = load_workbook(RESULT_TEMPLATE_FILE)
     temporary = None
@@ -2398,18 +2750,41 @@ def validate_rolling_result(data: ModelData, rolling: RollingResult) -> float:
             result.forecast.used_prior_load and result.forecast.used_prior_photovoltaic
         ):
             raise RuntimeError(f"{result.day} 没有训练样本时的先验回退标记不一致。")
-        # 包括 12 月 31 日在内的所有日计划均采用普通日末软目标。
-        validate_plan(result.day, result.forecast, result.plan, previous_energy, False)
+        expected_prior_price = result.day == data.dates[0]
+        if result.forecast.used_prior_price != expected_prior_price:
+            raise RuntimeError(f"{result.day} 的电价先验回退标记与历史样本不一致。")
+        if not np.isclose(
+            result.hyperparameters.terminal_penalty,
+            float(np.max(result.forecast.price)),
+            atol=1e-12,
+            rtol=0.0,
+        ):
+            raise RuntimeError(f"{result.day} 的日末惩罚系数不等于当日价格预测最大值。")
+        validate_plan(result.day, result.forecast, result.plan, previous_energy)
         validate_replay(result.day, result.plan, result.replay, result.actual_load_energy, result.actual_photovoltaic_energy)
         if abs(previous_energy - result.replay.stored_energy[0]) > BOUND_TOLERANCE:
             raise RuntimeError(f"{result.day} 实际储电量跨日不连续。")
         if abs(terminal_diagnostics(result)["identity_residual_kwh"]) > N_PERIODS * BALANCE_TOLERANCE:
             raise RuntimeError(f"{result.day} 计划与实际储电偏差不能由充放电截断解释。")
-        cost = float(data.price @ result.plan.grid_purchase)
-        emergency = float(EMERGENCY_PRICE_MULTIPLIER * (data.price @ result.replay.emergency_purchase))
-        if not np.isfinite([result.planned_purchase_cost, result.emergency_purchase_cost, result.realized_total_cost]).all():
+        cost = float(result.actual_price @ result.plan.grid_purchase)
+        forecast_cost = float(result.forecast.price @ result.plan.grid_purchase)
+        emergency = float(
+            EMERGENCY_PRICE_MULTIPLIER
+            * (result.actual_price @ result.replay.emergency_purchase)
+        )
+        if not np.isfinite([
+            result.planned_purchase_cost,
+            result.forecast_planned_purchase_cost,
+            result.emergency_purchase_cost,
+            result.realized_total_cost,
+        ]).all():
             raise RuntimeError(f"{result.day} 费用非有限。")
-        if max(abs(cost - result.planned_purchase_cost), abs(emergency - result.emergency_purchase_cost), abs(cost + emergency - result.realized_total_cost)) > BALANCE_TOLERANCE:
+        if max(
+            abs(cost - result.planned_purchase_cost),
+            abs(forecast_cost - result.forecast_planned_purchase_cost),
+            abs(emergency - result.emergency_purchase_cost),
+            abs(cost + emergency - result.realized_total_cost),
+        ) > BALANCE_TOLERANCE:
             raise RuntimeError(f"{result.day} 原始精度费用重算失败。")
         previous_energy = float(result.replay.stored_energy[-1])
     total_residual = sum(float(np.sum(
@@ -2453,8 +2828,8 @@ def terminal_diagnostics(result: DailyResult) -> dict[str, float]:
     }
 
 
-def require_terminal_interval(result: DailyResult) -> None:
-    """正式发布前只检查 12 月 31 日实际执行末态，自检调用同一函数。"""
+def require_actual_terminal_interval(result: DailyResult) -> None:
+    """全年运行结束后，只检查12月31日实际末态是否位于允许区间。"""
     if result.day != YEAR_END:
         raise RuntimeError("终端门禁必须检查12月31日，不能用其他日期代替。")
     diagnostics = terminal_diagnostics(result)
@@ -2462,13 +2837,10 @@ def require_terminal_interval(result: DailyResult) -> None:
         raise RuntimeError("年末终端诊断包含非有限值，禁止发布。")
     if diagnostics["actual_error_kwh"] > TERMINAL_TOLERANCE:
         raise RuntimeError(
-            f"实际终端区间校验失败：实际末态={diagnostics['actual_end_kwh']:.6f}，"
+            f"年末实际储电量校验失败：实际末态={diagnostics['actual_end_kwh']:.6f}，"
             f"要求位于[{E_TERMINAL_MIN:g}, {E_TERMINAL_MAX:g}] kWh。"
-            f"计划末态={diagnostics['planned_end_kwh']:.6f} kWh（仅作诊断，不参与终端验收）。"
-            f"充电截断影响={diagnostics['charge_shortfall_soc_effect_kwh']:+.6f} kWh，"
-            f"放电截断影响={diagnostics['discharge_shortfall_soc_effect_kwh']:+.6f} kWh。"
-            f"诊断保留于 {OUTPUT_TABLE_DIR}，未发布正式 result2.xlsx。"
-            "禁止用当日标签反向修改计划、用紧急购电补储能或覆盖实际末态。"
+            f"计划末态={diagnostics['planned_end_kwh']:.6f} kWh，仅用于诊断。"
+            f"诊断保留于 {OUTPUT_TABLE_DIR}，未发布正式 result4-2.xlsx。"
         )
 
 
@@ -2490,18 +2862,20 @@ def write_terminal_audit(result: DailyResult) -> Path:
                      charge_shortfall, discharge_shortfall,
                      float(result.plan.stored_energy[t + 1]), float(result.replay.stored_energy[t + 1]),
                      actual_gap, explained, actual_gap - explained))
-    return write_csv(OUTPUT_TABLE_DIR / "2_年末终端偏差分解.csv", header, rows)
+    return write_csv(TERMINAL_AUDIT_FILE, header, rows)
 
 
 def write_daily_audit(data: ModelData, rolling: RollingResult) -> Path:
     """即使年末终端区间校验失败，也保留每天的参数、求解器精度和费用。"""
-    header = ("日期", "阶段", "预测历史截止", "调参历史截止", "负载先验回退", "光伏先验回退",
-              "负载衰减天数", "光伏衰减天数", "终端惩罚", "求解路径", "求解状态", "MIP相对间隙",
+    header = ("日期", "阶段", "预测历史截止", "调参历史截止",
+              "负载先验回退", "光伏先验回退", "电价先验回退",
+              "负载衰减天数", "光伏衰减天数", "价格水平权重", "价格形态衰减天数", "终端惩罚",
+              "求解路径", "求解状态", "MIP相对间隙",
               "日内滚动求解次数", "日初储电量", "计划日末储电量", "实际日末储电量",
-              "计划购电费", "紧急购电费", "实际总购电费",
-              "净负荷MAE", "净负荷0.8分位数损失",
+              "计划购电费（预测口径）", "计划购电费（实际口径）", "紧急购电费", "实际总购电费",
+              "电价MAE", "净负荷MAE", "净负荷0.8分位数损失",
               "净负荷覆盖率", "紧急购电费占比", "紧急购电量", "未利用计划购电量",
-              "未利用计划购电对应费用（已含在计划费用中）", "实际弃光量",
+              "未利用计划购电对应费用（实际电价，已含在计划费用中）", "实际弃光量",
               "计划与实际充电量之差", "计划与实际放电量之差", "实际减计划日末储电量", "计划与实际末态偏差恒等式残差")
     rows = []
     for day in rolling.warmup_days + rolling.official_days:
@@ -2513,24 +2887,30 @@ def write_daily_audit(data: ModelData, rolling: RollingResult) -> Path:
             day.forecast.latest_training_date or "附件1", day.parameter_latest_date or "预设参数",
             "是" if day.forecast.used_prior_load else "否",
             "是" if day.forecast.used_prior_photovoltaic else "否",
+            "是" if day.forecast.used_prior_price else "否",
             day.hyperparameters.load_decay_days, day.hyperparameters.photovoltaic_decay_days,
+            "-".join(f"{weight:g}" for weight in day.hyperparameters.price_level_weights),
+            f"{day.hyperparameters.price_shape_decay_days:g}",
             day.hyperparameters.terminal_penalty, day.plan.solver_kind, day.plan.solver_message,
             f"{day.plan.mip_gap:.12g}", len(day.replay.steps),
             display_number(day.replay.stored_energy[0]), display_number(day.plan.stored_energy[-1]),
-            display_number(day.replay.stored_energy[-1]), display_number(day.planned_purchase_cost),
+            display_number(day.replay.stored_energy[-1]),
+            display_number(day.forecast_planned_purchase_cost),
+            display_number(day.planned_purchase_cost),
             display_number(day.emergency_purchase_cost), display_number(day.realized_total_cost),
+            display_number(float(np.mean(np.abs(day.actual_price - day.forecast.price)))),
             display_number(float(np.mean(np.abs(actual_net - forecast_net)))),
             display_number(pinball_loss(actual_net, forecast_net, NET_LOAD_QUANTILE)),
             display_number(float(np.mean(actual_net <= forecast_net))),
             display_number(day.emergency_purchase_cost / day.realized_total_cost if day.realized_total_cost else 0.0),
             display_number(float(np.sum(day.replay.emergency_purchase))),
             display_number(float(np.sum(day.replay.unused_planned_purchase))),
-            display_number(float(data.price @ day.replay.unused_planned_purchase)),
+            display_number(float(day.actual_price @ day.replay.unused_planned_purchase)),
             display_number(float(np.sum(day.replay.curtailment))),
             display_number(diagnostic["charge_shortfall_kwh"]), display_number(diagnostic["discharge_shortfall_kwh"]),
             display_number(diagnostic["actual_minus_planned_kwh"]), diagnostic["identity_residual_kwh"],
         ))
-    return write_csv(OUTPUT_TABLE_DIR / "2_每日运行审计.csv", header, rows)
+    return write_csv(DAILY_AUDIT_FILE, header, rows)
 
 
 def main() -> None:
@@ -2550,10 +2930,11 @@ def main() -> None:
     output_files = [
         write_daily_audit(data, rolling_result),
         write_check_csv(rolling_result),
+        write_price_forecast_csv(data, rolling_result),
         write_detail_csv(data, rolling_result.official_days),
         write_terminal_audit(rolling_result.official_days[-1]),
     ]
-    require_terminal_interval(rolling_result.official_days[-1])
+    require_actual_terminal_interval(rolling_result.official_days[-1])
     output_files.extend((
         write_purchase_summary_csv(data, rolling_result.official_days),
         write_storage_summary_csv(rolling_result.official_days),
