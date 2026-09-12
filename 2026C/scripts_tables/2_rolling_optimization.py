@@ -1,10 +1,14 @@
-"""问题二：按日滚动预测、制定购电计划并回放实际运行。
+"""问题二：按日滚动预测购电，并在日内滚动调整储能。
 
 在 conda 环境 2026C 中运行：
     python scripts_tables/2_rolling_optimization.py
 
 采用 docs/Q2.md 的负载上分位数、光伏下分位数预测，仅使用计划日前的数据。
-年末计划和实际储电量均须位于 [5400, 6600] kWh。
+每天 0:00 只冻结当天 144 个时段的计划购电量；储能充放电量不冻结，日内每 10 分钟
+按“当前时段用实测、未来时段用 0:00 预测”的因果信息集滚动优化剩余时域的储能动作，
+只执行当前时段。充电只能来自“冻结购电量＋光伏”扣除负载后的盈余，放电只能用于
+负载缺口，因此充电与放电逐时段互斥，紧急购电也不会流入储能。日末储电量按 0:00
+已确定的惩罚系数 λE 计入软目标；年末计划与实际储电量均须位于 [5400, 6600] kWh。
 CSV 写入 outputs/tables，正式工作簿写入 outputs/results/result2.xlsx。
 """
 
@@ -26,7 +30,7 @@ from typing import Iterable, Sequence
 import numpy as np
 from openpyxl import load_workbook
 from scipy.optimize import Bounds, LinearConstraint, linprog, milp
-from scipy.sparse import lil_matrix
+from scipy.sparse import coo_matrix, lil_matrix
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -71,7 +75,10 @@ PHOTOVOLTAIC_QUANTILE = 0.2
 NET_LOAD_QUANTILE = 1.0 - 1.0 / EMERGENCY_PRICE_MULTIPLIER
 PHOTOVOLTAIC_NOISE_THRESHOLD = 1.0
 DECAY_DAY_CANDIDATES = (3.0, 5.0, 7.0, 10.0, 14.0, 21.0, 28.0, 42.0, 56.0, 84.0)
-TERMINAL_PENALTY_MULTIPLIERS = (0.5, 1.0, 2.0, 5.0)
+# 日末储电量惩罚系数预先固定为 1.0 × max_t p_t：低价时段的购电成本（约 0.41 元/kWh）
+# 已低于该边际价值，因此日末软目标会把计划与实际储电量稳定拉回 E_REFERENCE，
+# 该系数不再逐日调参（原候选集在本题数据上完全退化，全部候选给出同一计划）。
+TERMINAL_PENALTY_MULTIPLIERS = (1.0,)
 # 参数候选、验证窗口、评分方式及默认参数均在初始化前固定。验证记录从
 # 第一个已经结束的日期开始积累；没有可用记录时由 choose_candidate 使用默认值。
 TUNING_START_INDEX = 0
@@ -171,8 +178,25 @@ class PlanResult:
 
 
 @dataclass(frozen=True)
+class IntradayStep:
+    """一次日内滚动求解在本时段实际执行的动作与诊断信息。"""
+
+    period_index: int
+    horizon: int
+    charge: float
+    discharge: float
+    emergency_purchase: float
+    curtailment: float
+    unused_planned_purchase: float
+    predicted_final_energy: float
+    charge_capacity: float
+    discharge_capacity: float
+    solver_message: str
+
+
+@dataclass(frozen=True)
 class ReplayResult:
-    """固定计划后按实际负载和光伏逐时段回放的结果。"""
+    """购电量冻结后按日内滚动优化执行的实际运行结果。"""
 
     charge: np.ndarray
     discharge: np.ndarray
@@ -180,6 +204,7 @@ class ReplayResult:
     curtailment: np.ndarray
     unused_planned_purchase: np.ndarray
     stored_energy: np.ndarray
+    steps: tuple[IntradayStep, ...]
 
 
 @dataclass(frozen=True)
@@ -815,13 +840,193 @@ def solve_daily_plan(
     )
 
 
-def replay_actual_day(
+def solve_intraday_step(
+    period_index: int,
+    price: np.ndarray,
     plan: PlanResult,
+    forecast: Forecast,
+    actual_load_now: float,
+    actual_photovoltaic_now: float,
+    current_energy: float,
+    terminal_penalty: float,
+) -> IntradayStep:
+    """求解从当前时段到日末的剩余时域 LP，返回本时段实际执行的动作。
+
+    当前时段使用实测负载与实测光伏，未来时段只使用 0:00 已保存的预测，
+    因此日内决策是因果的。充电量上界取“冻结购电量＋光伏”扣除负载后的盈余，
+    放电量上界取负载扣除冻结购电与光伏后的缺口：两个上界不会同时为正，
+    故充放电天然互斥，且紧急购电（只补缺口）不会流入储能。
+    目标为剩余紧急购电费与日末储电量偏离 E_REFERENCE 的惩罚之和。
+    """
+    if not 0 <= period_index < N_PERIODS:
+        raise ValueError("日内滚动的时段索引超出范围。")
+    if not E_MIN - BOUND_TOLERANCE <= current_energy <= E_MAX + BOUND_TOLERANCE:
+        raise ValueError("日内滚动的初始储电量超出设备安全范围。")
+    if not isfinite(terminal_penalty) or terminal_penalty < 0:
+        raise ValueError("日末储电量惩罚系数必须为有限非负数。")
+    for values in (price, plan.grid_purchase, forecast.load_energy, forecast.photovoltaic_energy):
+        if values.shape != (N_PERIODS,) or not np.isfinite(values).all() or np.any(values < 0):
+            raise ValueError("日内滚动的电价、冻结购电量和预测值须为 144 个有限非负数。")
+    if np.any(price <= 0):
+        raise ValueError("日内滚动模型要求电价严格为正。")
+
+    horizon = N_PERIODS - period_index
+    price_h = np.asarray(price[period_index:], dtype=float)
+    planned_h = np.asarray(plan.grid_purchase[period_index:], dtype=float)
+    load_h = np.asarray(forecast.load_energy[period_index:], dtype=float).copy()
+    photovoltaic_h = np.asarray(
+        forecast.photovoltaic_energy[period_index:], dtype=float
+    ).copy()
+    # 按 Q2 的时段内常量假设，进入当前时段即可读取这一对实测值。
+    load_h[0] = validate_nonnegative_number(actual_load_now, "当前时段实际负载")
+    photovoltaic_h[0] = validate_nonnegative_number(
+        actual_photovoltaic_now, "当前时段实际光伏"
+    )
+
+    charge_capacity = np.minimum(
+        CHARGE_LIMIT,
+        np.maximum(planned_h + photovoltaic_h - load_h, 0.0),
+    )
+    discharge_capacity = np.minimum(
+        DISCHARGE_LIMIT,
+        np.maximum(load_h - planned_h - photovoltaic_h, 0.0),
+    )
+
+    offset_charge = 0
+    offset_discharge = horizon
+    offset_emergency = 2 * horizon
+    offset_curtailment = 3 * horizon
+    offset_unused = 4 * horizon
+    offset_energy = 5 * horizon
+    offset_positive = 6 * horizon + 1
+    offset_negative = 6 * horizon + 2
+    variable_count = 6 * horizon + 3
+
+    objective = np.zeros(variable_count)
+    objective[offset_emergency:offset_emergency + horizon] = (
+        EMERGENCY_PRICE_MULTIPLIER * price_h
+    )
+    objective[offset_positive] = terminal_penalty
+    objective[offset_negative] = terminal_penalty
+
+    lower_bounds = np.zeros(variable_count)
+    upper_bounds = np.full(variable_count, np.inf)
+    upper_bounds[offset_charge:offset_charge + horizon] = charge_capacity
+    upper_bounds[offset_discharge:offset_discharge + horizon] = discharge_capacity
+    upper_bounds[offset_emergency:offset_emergency + horizon] = load_h
+    upper_bounds[offset_curtailment:offset_curtailment + horizon] = photovoltaic_h
+    upper_bounds[offset_unused:offset_unused + horizon] = planned_h
+    lower_bounds[offset_energy:offset_energy + horizon + 1] = E_MIN
+    upper_bounds[offset_energy:offset_energy + horizon + 1] = E_MAX
+    lower_bounds[offset_energy] = current_energy
+    upper_bounds[offset_energy] = current_energy
+
+    steps = np.arange(horizon)
+    balance_rows = np.repeat(steps, 5)
+    balance_cols = np.stack([
+        offset_charge + steps,
+        offset_discharge + steps,
+        offset_emergency + steps,
+        offset_curtailment + steps,
+        offset_unused + steps,
+    ]).T.ravel()
+    balance_data = np.tile(np.array([-1.0, 1.0, 1.0, -1.0, -1.0]), horizon)
+    state_rows = np.repeat(horizon + steps, 4)
+    state_cols = np.stack([
+        offset_energy + steps,
+        offset_energy + steps + 1,
+        offset_charge + steps,
+        offset_discharge + steps,
+    ]).T.ravel()
+    state_data = np.tile(
+        np.array([-1.0, 1.0, -ETA_CHARGE, 1.0 / ETA_DISCHARGE]), horizon
+    )
+    terminal_row = 2 * horizon
+    matrix = coo_matrix(
+        (
+            np.concatenate([balance_data, state_data, [1.0, -1.0, 1.0]]),
+            (
+                np.concatenate([balance_rows, state_rows, np.full(3, terminal_row)]),
+                np.concatenate([
+                    balance_cols,
+                    state_cols,
+                    [offset_energy + horizon, offset_positive, offset_negative],
+                ]),
+            ),
+        ),
+        shape=(2 * horizon + 1, variable_count),
+    ).tocsr()
+    right_hand_side = np.concatenate([
+        load_h - planned_h - photovoltaic_h,
+        np.zeros(horizon),
+        [E_REFERENCE],
+    ])
+
+    result = linprog(
+        c=objective,
+        A_eq=matrix,
+        b_eq=right_hand_side,
+        bounds=np.column_stack((lower_bounds, upper_bounds)),
+        method="highs",
+        options={
+            "presolve": True,
+            "primal_feasibility_tolerance": 1e-9,
+            "dual_feasibility_tolerance": 1e-9,
+        },
+    )
+    if not result.success or result.x is None:
+        raise RuntimeError(
+            f"第 {period_index + 1} 时段日内滚动求解失败，状态码 {result.status}："
+            f"{result.message}"
+        )
+    solution = result.x
+    if not np.isfinite(solution).all() or not isfinite(float(result.fun)):
+        raise RuntimeError("日内滚动求解返回非有限值。")
+
+    charge_now = float(solution[offset_charge])
+    discharge_now = float(solution[offset_discharge])
+    emergency_now = float(solution[offset_emergency])
+    curtailment_now = float(solution[offset_curtailment])
+    unused_now = float(solution[offset_unused])
+    balance_residual = (
+        planned_h[0] + photovoltaic_h[0] + discharge_now + emergency_now
+        - curtailment_now - unused_now - load_h[0] - charge_now
+    )
+    expected_emergency = max(
+        load_h[0] - planned_h[0] - photovoltaic_h[0] - discharge_now, 0.0
+    )
+    if abs(balance_residual) > BALANCE_TOLERANCE:
+        raise RuntimeError(f"第 {period_index + 1} 时段日内电量平衡残差超限。")
+    if abs(emergency_now - expected_emergency) > BALANCE_TOLERANCE:
+        raise RuntimeError(f"第 {period_index + 1} 时段紧急购电量不等于实际负载缺口。")
+    if min(charge_now, discharge_now) > BOUND_TOLERANCE:
+        raise RuntimeError(f"第 {period_index + 1} 时段同时充放电。")
+
+    return IntradayStep(
+        period_index=period_index,
+        horizon=horizon,
+        charge=charge_now,
+        discharge=discharge_now,
+        emergency_purchase=emergency_now,
+        curtailment=curtailment_now,
+        unused_planned_purchase=unused_now,
+        predicted_final_energy=float(solution[offset_energy + horizon]),
+        charge_capacity=float(charge_capacity[0]),
+        discharge_capacity=float(discharge_capacity[0]),
+        solver_message=str(result.message),
+    )
+
+
+def replay_actual_day(
+    price: np.ndarray,
+    plan: PlanResult,
+    forecast: Forecast,
     actual_load_energy: np.ndarray,
     actual_photovoltaic_energy: np.ndarray,
     initial_energy: float,
+    terminal_penalty: float,
 ) -> ReplayResult:
-    """固定日计划，按 docs/Q2.md 的优先级规则回放实际运行。"""
+    """购电量冻结，储能按日内滚动优化逐时段执行。"""
     charge = np.zeros(N_PERIODS)
     discharge = np.zeros(N_PERIODS)
     emergency_purchase = np.zeros(N_PERIODS)
@@ -829,74 +1034,30 @@ def replay_actual_day(
     unused_planned_purchase = np.zeros(N_PERIODS)
     stored_energy = np.empty(N_PERIODS + 1)
     stored_energy[0] = initial_energy
+    steps: list[IntradayStep] = []
 
     for period_index in range(N_PERIODS):
-        current_energy = stored_energy[period_index]
-        planned_purchase = plan.grid_purchase[period_index]
-        photovoltaic_energy = actual_photovoltaic_energy[period_index]
-        load_energy = actual_load_energy[period_index]
-
-        load_deficit_before_storage = max(
-            load_energy - planned_purchase - photovoltaic_energy,
-            0.0,
+        step = solve_intraday_step(
+            period_index,
+            price,
+            plan,
+            forecast,
+            float(actual_load_energy[period_index]),
+            float(actual_photovoltaic_energy[period_index]),
+            float(stored_energy[period_index]),
+            terminal_penalty,
         )
-        available_discharge = max(
-            ETA_DISCHARGE * (current_energy - E_MIN),
-            0.0,
-        )
-        discharge[period_index] = min(
-            max(plan.discharge[period_index], 0.0),
-            DISCHARGE_LIMIT,
-            available_discharge,
-            load_deficit_before_storage,
-        )
-
-        emergency_purchase[period_index] = max(
-            load_energy
-            - planned_purchase
-            - photovoltaic_energy
-            - discharge[period_index],
-            0.0,
-        )
-
-        surplus_after_load = max(
-            planned_purchase
-            + photovoltaic_energy
-            + discharge[period_index]
-            - load_energy,
-            0.0,
-        )
-        storage_headroom = max((E_MAX - current_energy) / ETA_CHARGE, 0.0)
-        charge[period_index] = min(
-            max(plan.charge[period_index], 0.0),
-            CHARGE_LIMIT,
-            storage_headroom,
-            surplus_after_load,
-        )
-
+        charge[period_index] = step.charge
+        discharge[period_index] = step.discharge
+        emergency_purchase[period_index] = step.emergency_purchase
+        curtailment[period_index] = step.curtailment
+        unused_planned_purchase[period_index] = step.unused_planned_purchase
         stored_energy[period_index + 1] = (
-            current_energy
-            + ETA_CHARGE * charge[period_index]
-            - discharge[period_index] / ETA_DISCHARGE
+            stored_energy[period_index]
+            + ETA_CHARGE * step.charge
+            - step.discharge / ETA_DISCHARGE
         )
-
-        remaining_energy = max(
-            planned_purchase
-            + photovoltaic_energy
-            + discharge[period_index]
-            + emergency_purchase[period_index]
-            - load_energy
-            - charge[period_index],
-            0.0,
-        )
-        curtailment[period_index] = min(
-            photovoltaic_energy,
-            remaining_energy,
-        )
-        unused_planned_purchase[period_index] = max(
-            remaining_energy - curtailment[period_index],
-            0.0,
-        )
+        steps.append(step)
 
     return ReplayResult(
         charge=charge,
@@ -905,6 +1066,7 @@ def replay_actual_day(
         curtailment=curtailment,
         unused_planned_purchase=unused_planned_purchase,
         stored_energy=stored_energy,
+        steps=tuple(steps),
     )
 
 
@@ -1010,7 +1172,7 @@ def validate_replay(
     actual_load_energy: np.ndarray,
     actual_photovoltaic_energy: np.ndarray,
 ) -> None:
-    """检查实际回放的平衡、边界、优先级和紧急购电口径。"""
+    """检查日内滚动执行的平衡、设备边界与“紧急电不充储能”口径。"""
     for name in ("charge", "discharge", "emergency_purchase", "curtailment", "unused_planned_purchase", "stored_energy"):
         array = getattr(replay, name)
         size = N_PERIODS + (name == "stored_energy")
@@ -1039,6 +1201,18 @@ def validate_replay(
         - replay.discharge,
         0.0,
     )
+    charge_capacity = np.minimum(
+        CHARGE_LIMIT,
+        np.maximum(
+            plan.grid_purchase + actual_photovoltaic_energy - actual_load_energy, 0.0
+        ),
+    )
+    discharge_capacity = np.minimum(
+        DISCHARGE_LIMIT,
+        np.maximum(
+            actual_load_energy - plan.grid_purchase - actual_photovoltaic_energy, 0.0
+        ),
+    )
     failures: list[str] = []
     if np.max(np.abs(balance_residual)) > BALANCE_TOLERANCE:
         failures.append("实际电量平衡残差超限")
@@ -1049,10 +1223,10 @@ def validate_replay(
         > BALANCE_TOLERANCE
     ):
         failures.append("紧急购电量不等于实际负载缺口")
-    if np.max(replay.charge - plan.charge) > BOUND_TOLERANCE:
-        failures.append("实际充电量超过计划充电指令")
-    if np.max(replay.discharge - plan.discharge) > BOUND_TOLERANCE:
-        failures.append("实际放电量超过计划放电指令")
+    if np.max(replay.charge - charge_capacity) > BOUND_TOLERANCE:
+        failures.append("实际充电量超过可充盈余（含紧急电充电）")
+    if np.max(replay.discharge - discharge_capacity) > BOUND_TOLERANCE:
+        failures.append("实际放电量超过实际负载缺口")
     if np.max(replay.charge) > CHARGE_LIMIT + BOUND_TOLERANCE:
         failures.append("实际充电量超过时段功率上限")
     if np.max(replay.discharge) > DISCHARGE_LIMIT + BOUND_TOLERANCE:
@@ -1084,7 +1258,7 @@ def validate_replay(
         failures.append("实际储电量高于安全上限")
 
     if failures:
-        raise RuntimeError(f"{day} 实际回放校验失败：" + "；".join(failures))
+        raise RuntimeError(f"{day} 日内滚动执行校验失败：" + "；".join(failures))
 
 
 def solve_validated_plan(
@@ -1106,7 +1280,7 @@ def solve_validated_plan(
 
 
 def solve_rolling_model(data: ModelData, engine: ForecastEngine) -> RollingResult:
-    """逐日冻结预测与计划，实际回放后才更新下一日的验证记录和储电量。"""
+    """逐日预测并冻结购电量，日内滚动调整储能，日末才更新实际状态与历史。"""
     penalties = np.max(data.price) * np.asarray(TERMINAL_PENALTY_MULTIPLIERS)
     default_penalty = TERMINAL_PENALTY_MULTIPLIERS.index(1.0)
     default_decay = DECAY_DAY_CANDIDATES.index(DEFAULT_DECAY_DAYS)
@@ -1158,7 +1332,13 @@ def solve_rolling_model(data: ModelData, engine: ForecastEngine) -> RollingResul
         # 选定并冻结 selected_plan 后才读取当天实测；各候选共用相同实际日初状态。
         actual_load = data.actual_load_energy[day_index]
         actual_pv = data.actual_photovoltaic_energy[day_index]
-        replays = [replay_actual_day(plan, actual_load, actual_pv, initial_energy) for plan in plans]
+        replays = [
+            replay_actual_day(
+                data.price, plan, forecast, actual_load, actual_pv,
+                initial_energy, float(penalty),
+            )
+            for plan, penalty in zip(plans, penalties)
+        ]
         for plan, replay in zip(plans, replays):
             validate_replay(day, plan, replay, actual_load, actual_pv)
         planned_costs = np.array([float(data.price @ plan.grid_purchase) for plan in plans])
@@ -1286,8 +1466,8 @@ def write_detail_csv(
         "时段总购电费（元）",
         "预测净负荷（kWh）",
         "实际净负荷（kWh）",
-        "计划充电截断量（kWh）",
-        "计划放电截断量（kWh）",
+        "计划与实际充电量之差（kWh）",
+        "计划与实际放电量之差（kWh）",
     )
 
     def rows() -> Iterable[Sequence[object]]:
@@ -1538,6 +1718,15 @@ def build_check_rows(
     planned_discharge = concatenate_result_array(results, "plan", "discharge")
     actual_charge = concatenate_result_array(results, "replay", "charge")
     actual_discharge = concatenate_result_array(results, "replay", "discharge")
+    # 日内滚动的物理上界：充电只能来自冻结购电与光伏的盈余，放电只能用于负载缺口。
+    charge_capacity_official = np.minimum(
+        CHARGE_LIMIT,
+        np.maximum(planned_purchase + actual_photovoltaic - actual_load, 0.0),
+    )
+    discharge_capacity_official = np.minimum(
+        DISCHARGE_LIMIT,
+        np.maximum(actual_load - planned_purchase - actual_photovoltaic, 0.0),
+    )
     emergency_purchase = concatenate_result_array(
         results, "replay", "emergency_purchase"
     )
@@ -1838,15 +2027,15 @@ def build_check_rows(
         ),
         (
             "边界",
-            "最大实际充电量超过计划量",
-            display_number(float(np.max(actual_charge - planned_charge))),
+            "实际充电量超过可充盈余的最大值",
+            display_number(float(np.max(actual_charge - charge_capacity_official))),
             "kWh",
             "通过",
         ),
         (
             "边界",
-            "最大实际放电量超过计划量",
-            display_number(float(np.max(actual_discharge - planned_discharge))),
+            "实际放电量超过实际负载缺口的最大值",
+            display_number(float(np.max(actual_discharge - discharge_capacity_official))),
             "kWh",
             "通过",
         ),
@@ -1866,8 +2055,10 @@ def build_check_rows(
         ("预测", "净负荷 0.8 分位数损失", display_number(pinball_loss(actual_net, forecast_net, NET_LOAD_QUANTILE)), "kWh/时段", "参考"),
         ("预测", "净负荷实际值不超过预测值的时段比例",
          display_number(float(np.mean(actual_net <= forecast_net))), "比例", "参考"),
-        ("执行", "计划充电截断总量", display_number(float(np.sum(planned_charge - actual_charge))), "kWh", "参考"),
-        ("执行", "计划放电截断总量", display_number(float(np.sum(planned_discharge - actual_discharge))), "kWh", "参考"),
+        ("执行", "日内滚动求解次数", str(sum(len(day.replay.steps) for day in results)), "次", "通过"),
+        ("执行", "日内滚动求解失败次数", "0", "次", "通过"),
+        ("执行", "计划充电量与实际充电量之差总量", display_number(float(np.sum(planned_charge - actual_charge))), "kWh", "参考"),
+        ("执行", "计划放电量与实际放电量之差总量", display_number(float(np.sum(planned_discharge - actual_discharge))), "kWh", "参考"),
         ("边界", "年末实际储电量减计划储电量",
          display_number(results[-1].replay.stored_energy[-1] - results[-1].plan.stored_energy[-1]), "kWh", "参考"),
     ))
@@ -2308,12 +2499,12 @@ def write_daily_audit(data: ModelData, rolling: RollingResult) -> Path:
     """即使年末终端区间校验失败，也保留每天的参数、求解器精度和费用。"""
     header = ("日期", "阶段", "预测历史截止", "调参历史截止", "负载先验回退", "光伏先验回退",
               "负载衰减天数", "光伏衰减天数", "终端惩罚", "求解路径", "求解状态", "MIP相对间隙",
-              "日初储电量", "计划日末储电量", "实际日末储电量",
+              "日内滚动求解次数", "日初储电量", "计划日末储电量", "实际日末储电量",
               "计划购电费", "紧急购电费", "实际总购电费",
               "净负荷MAE", "净负荷0.8分位数损失",
               "净负荷覆盖率", "紧急购电费占比", "紧急购电量", "未利用计划购电量",
               "未利用计划购电对应费用（已含在计划费用中）", "实际弃光量",
-              "计划充电截断量", "计划放电截断量", "实际减计划日末储电量", "截断偏差恒等式残差")
+              "计划与实际充电量之差", "计划与实际放电量之差", "实际减计划日末储电量", "计划与实际末态偏差恒等式残差")
     rows = []
     for day in rolling.warmup_days + rolling.official_days:
         actual_net = day.actual_load_energy - day.actual_photovoltaic_energy
@@ -2326,7 +2517,7 @@ def write_daily_audit(data: ModelData, rolling: RollingResult) -> Path:
             "是" if day.forecast.used_prior_photovoltaic else "否",
             day.hyperparameters.load_decay_days, day.hyperparameters.photovoltaic_decay_days,
             day.hyperparameters.terminal_penalty, day.plan.solver_kind, day.plan.solver_message,
-            f"{day.plan.mip_gap:.12g}",
+            f"{day.plan.mip_gap:.12g}", len(day.replay.steps),
             display_number(day.replay.stored_energy[0]), display_number(day.plan.stored_energy[-1]),
             display_number(day.replay.stored_energy[-1]), display_number(day.planned_purchase_cost),
             display_number(day.emergency_purchase_cost), display_number(day.realized_total_cost),

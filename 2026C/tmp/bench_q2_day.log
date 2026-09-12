@@ -1,0 +1,14 @@
+Traceback (most recent call last):
+  File "/Users/mistvillion/Documents/GitHub Repositories/Mathematical-Modelling/2026C/tmp/bench_q2_day.py", line 25, in <module>
+    load_scores = mod.historical_scores(losses_load, day_index, len(mod.DECAY_DAY_CANDIDATES), data.dates, True)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/mistvillion/Documents/GitHub Repositories/Mathematical-Modelling/2026C/scripts_tables/2_rolling_optimization.py", line 735, in historical_scores
+    indices = validation_indices(losses, day_index, dates, same_load_type)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/mistvillion/Documents/GitHub Repositories/Mathematical-Modelling/2026C/scripts_tables/2_rolling_optimization.py", line 692, in validation_indices
+    raise RuntimeError("验证损失的截止日与计划日不一致。")
+RuntimeError: 验证损失的截止日与计划日不一致。
+ERROR conda.cli.main_run:execute(142): `conda run python tmp/bench_q2_day.py 2` failed. (See above for error)
+load data: 0.19s
+2025-01-01: forecast=0.00s plan(4 candidates)=0.06s replay(4x144x2 solves)=6.01s daytotal=6.07s cost=199513.77 end_energy=5661.1
+HighsMipSolverData::transformNewIntegerFeasibleSolution tmpSolver.run();

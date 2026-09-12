@@ -1,0 +1,39 @@
+  intraday calls=500 total=10.1s last_slow=[]
+HighsMipSolverData::transformNewIntegerFeasibleSolution tmpSolver.run();
+  intraday calls=1000 total=19.8s last_slow=[]
+HighsMipSolverData::transformNewIntegerFeasibleSolution tmpSolver.run();
+HighsMipSolverData::transformNewIntegerFeasibleSolution tmpSolver.run();
+HighsMipSolverData::transformNewIntegerFeasibleSolution tmpSolver.run();
+HighsMipSolverData::transformNewIntegerFeasibleSolution tmpSolver.run();
+HighsMipSolverData::transformNewIntegerFeasibleSolution tmpSolver.run();
+HighsMipSolverData::transformNewIntegerFeasibleSolution tmpSolver.run();
+HighsMipSolverData::transformNewIntegerFeasibleSolution tmpSolver.run();
+HighsMipSolverData::transformNewIntegerFeasibleSolution tmpSolver.run();
+HighsMipSolverData::transformNewIntegerFeasibleSolution tmpSolver.run();
+HighsMipSolverData::transformNewIntegerFeasibleSolution tmpSolver.run();
+HighsMipSolverData::transformNewIntegerFeasibleSolution tmpSolver.run();
+HighsMipSolverData::transformNewIntegerFeasibleSolution tmpSolver.run();
+  intraday calls=1500 total=30.4s last_slow=[]
+  intraday calls=2000 total=40.9s last_slow=[]
+  intraday calls=2500 total=51.5s last_slow=[]
+  intraday calls=3000 total=61.9s last_slow=[]
+  intraday calls=3500 total=72.8s last_slow=[]
+  intraday calls=4000 total=84.3s last_slow=[]
+HighsMipSolverData::transformNewIntegerFeasibleSolution tmpSolver.run();
+  intraday calls=4500 total=95.4s last_slow=[]
+HighsMipSolverData::transformNewIntegerFeasibleSolution tmpSolver.run();
+HighsMipSolverData::transformNewIntegerFeasibleSolution tmpSolver.run();
+  intraday calls=5000 total=105.4s last_slow=[]
+HighsMipSolverData::transformNewIntegerFeasibleSolution tmpSolver.run();
+  intraday calls=5500 total=116.0s last_slow=[]
+HighsMipSolverData::transformNewIntegerFeasibleSolution tmpSolver.run();
+  intraday calls=6000 total=126.8s last_slow=[]
+HighsMipSolverData::transformNewIntegerFeasibleSolution tmpSolver.run();
+  intraday calls=6500 total=137.2s last_slow=[]
+HighsMipSolverData::transformNewIntegerFeasibleSolution tmpSolver.run();
+HighsMipSolverData::transformNewIntegerFeasibleSolution tmpSolver.run();
+HighsMipSolverData::transformNewIntegerFeasibleSolution tmpSolver.run();
+HighsMipSolverData::transformNewIntegerFeasibleSolution tmpSolver.run();
+  intraday calls=7000 total=148.6s last_slow=[]
+HighsMipSolverData::transformNewIntegerFeasibleSolution tmpSolver.run();
+  intraday calls=7500 total=159.3s last_slow=[]
