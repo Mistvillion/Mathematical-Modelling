@@ -1125,6 +1125,7 @@ def solve_realtime_scenario_step(
     actual_photovoltaic_now: float,
     current_energy: float,
     boundary_target_energy: float,
+    terminal_penalty: float | None = None,
 ) -> RealtimeStep:
     """固定购电后求解下一信息边界内的多时间尺度情景LP，只执行当前块动作。"""
     if not 0 <= period_index < N_PERIODS:
@@ -1146,6 +1147,10 @@ def solve_realtime_scenario_step(
     if not isfinite(boundary_target_energy):
         raise ValueError("实时边界储电量目标必须有限。")
     boundary_target_energy = float(np.clip(boundary_target_energy, E_MIN, E_MAX))
+    if terminal_penalty is None:
+        terminal_penalty = float(np.max(price))
+    if not isfinite(terminal_penalty) or terminal_penalty < 0:
+        raise ValueError("实时边界储电量软惩罚必须为有限非负数。")
 
     actual_load_now = q2.validate_nonnegative_number(actual_load_now, "当前实际负载")
     actual_photovoltaic_now = q2.validate_nonnegative_number(
@@ -1218,8 +1223,8 @@ def solve_realtime_scenario_step(
         objective[action_slice(offset_emergency, s)] = (
             probability * EMERGENCY_PRICE_MULTIPLIER * emergency_prices
         )
-        objective[offset_positive + s] = probability * np.max(price)
-        objective[offset_negative + s] = probability * np.max(price)
+        objective[offset_positive + s] = probability * terminal_penalty
+        objective[offset_negative + s] = probability * terminal_penalty
 
     lower = np.zeros(variable_count)
     upper = np.full(variable_count, np.inf)
